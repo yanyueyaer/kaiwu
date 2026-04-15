@@ -76,10 +76,10 @@ class Preprocessor:
         self.step_no = 0
         self.max_step = 2000
 
-        self.battery = 600
-        self.battery_max = 600
-        self.remaining_charge = 600
-        self.prev_remaining_charge = 600
+        self.battery = 200
+        self.battery_max = 200
+        self.remaining_charge = 200
+        self.prev_remaining_charge = 200
 
         self.cur_pos = (0, 0)
         self.last_action = -1
@@ -113,6 +113,7 @@ class Preprocessor:
         self.prev_explored_cells = 0
         self.expand_hold_until_step = -1
         self.post_charge_expand_until_step = -1
+        self.post_charge_release_until_step = -1
         self._expand_focus_target = None
         self._expand_focus_reason = ""
         self.prev_charge_cycle_explore_gain = 0
@@ -185,6 +186,7 @@ class Preprocessor:
             "target_dist": None,
             "target_dx": 0.0,
             "target_dz": 0.0,
+            "force_action": None,
             "soft_radius": 0,
             "hard_radius": 0,
             "desired_radius": 0,
@@ -228,6 +230,18 @@ class Preprocessor:
         if hold_steps <= 0:
             return
         self.post_charge_expand_until_step = max(self.post_charge_expand_until_step, self.step_no + hold_steps - 1)
+
+    def _activate_post_charge_release(self, hold_steps):
+        hold_steps = max(int(hold_steps), 0)
+        if hold_steps <= 0:
+            return
+        self.post_charge_release_until_step = max(
+            self.post_charge_release_until_step,
+            self.step_no + hold_steps - 1,
+        )
+
+    def _clear_post_charge_release(self):
+        self.post_charge_release_until_step = -1
 
     def _lock_charge_target(self, target_pos, hold_steps):
         if target_pos is None:
@@ -286,6 +300,9 @@ class Preprocessor:
     def _has_post_charge_expand(self):
         return bool(self.step_no <= self.post_charge_expand_until_step)
 
+    def _has_post_charge_release(self):
+        return bool(self.step_no <= self.post_charge_release_until_step)
+
     def _in_first_charge_phase(self):
         return bool(self.charge_count <= 0)
 
@@ -311,6 +328,54 @@ class Preprocessor:
     def _clear_expand_focus(self):
         self._expand_focus_target = None
         self._expand_focus_reason = ""
+
+    def _did_charge_this_step(self, target_dist=None):
+        if self.charge_count > self.prev_charge_count:
+            return True
+        if target_dist is None or int(target_dist) > 1:
+            return False
+        full_charge_jump = max(30, int(self.battery_max * 0.18))
+        return bool(
+            self.prev_remaining_charge <= self.battery_max - full_charge_jump
+            and self.remaining_charge >= self.battery_max - 1
+            and (self.remaining_charge - self.prev_remaining_charge) >= full_charge_jump
+        )
+
+    def _handle_charge_success(self):
+        self.prev_charge_cycle_explore_gain = max(0, self.explored_cells - self.charge_cycle_explore_start)
+        self.prev_charge_cycle_clean_gain = max(0, self.dirt_cleaned - self.charge_cycle_clean_start)
+        self.prev_charge_cycle_step_span = max(1, self.step_no - self.charge_cycle_start_step)
+        self.charge_cycle_explore_start = self.explored_cells
+        self.charge_cycle_clean_start = self.dirt_cleaned
+        self.charge_cycle_start_step = self.step_no
+        self._apply_post_charge_sequence()
+        self._clear_charge_target_lock()
+        self._clear_charge_route_commit()
+        self.return_to_charge_mode = False
+        self._charge_progress_stall_steps = 0
+        self._last_charge_target_pos = None
+
+    def _apply_post_charge_sequence(self):
+        inefficient_cycle = bool(
+            self.charge_count >= 4
+            and self.prev_charge_cycle_explore_gain <= 10
+            and self.prev_charge_cycle_clean_gain <= 12
+        )
+        release_steps = 4 if self.charge_count <= 2 else 3
+        expand_steps = 14 if self.charge_count <= 2 else 10
+        hold_steps = 10 if self.charge_count <= 2 else 8
+        if inefficient_cycle:
+            release_steps = 0
+            expand_steps = min(expand_steps, 6)
+            hold_steps = min(hold_steps, 4)
+
+        if release_steps > 0:
+            self._activate_post_charge_release(release_steps)
+        else:
+            self._clear_post_charge_release()
+        self._activate_post_charge_expand(expand_steps)
+        self._activate_expand_hold(hold_steps)
+        self._clear_expand_focus()
 
     def pb2struct(self, env_obs, last_action):
         observation = env_obs.get("observation", env_obs)
@@ -412,9 +477,7 @@ class Preprocessor:
             self._clear_charge_route_commit()
             return
 
-        final_dock_mode = bool(target_dist <= 2)
         route_reliable = bool(guidance.get("route_reliable"))
-
         same_target = bool(target_pos == self._last_charge_target_pos)
         if not same_target:
             self._clear_charge_route_commit()
@@ -428,17 +491,22 @@ class Preprocessor:
         elif progress >= 1.0:
             self._charge_progress_stall_steps = 0
         elif progress > 0.0:
-            decay = 2 if final_dock_mode else 1
+            decay = 2 if int(target_dist) <= 5 else 1
             self._charge_progress_stall_steps = max(self._charge_progress_stall_steps - decay, 0)
         elif progress == 0.0:
-            stall_inc = 1 if (final_dock_mode or (not route_reliable) or self._charge_progress_stall_steps > 0) else 0
+            stall_inc = 2 if int(target_dist) <= 5 else 1
             self._charge_progress_stall_steps = min(self._charge_progress_stall_steps + stall_inc, 12)
         else:
-            stall_inc = 2 if route_reliable else 3
+            if int(target_dist) <= 2:
+                stall_inc = 4
+            elif int(target_dist) <= 5:
+                stall_inc = 3
+            else:
+                stall_inc = 2 if route_reliable else 3
             self._charge_progress_stall_steps = min(self._charge_progress_stall_steps + stall_inc, 12)
 
-        stall_clear_threshold = 4 if final_dock_mode else (6 if route_reliable else 3)
-        if self._charge_progress_stall_steps >= stall_clear_threshold:
+        stall_clear_threshold = 5 if route_reliable else 4
+        if int(target_dist) > 2 and self._charge_progress_stall_steps >= stall_clear_threshold:
             self._charge_route_cache = None
             self._clear_charge_route_commit()
 
@@ -757,7 +825,7 @@ class Preprocessor:
                     "allow_unknown": bool(allow_unknown),
                 },
             )
-            self._commit_charge_route(preferred_route["target_pos"], hold_steps=3)
+            self._commit_charge_route(preferred_route["target_pos"], hold_steps=6)
             return preferred_route
 
         best_route = None
@@ -806,7 +874,7 @@ class Preprocessor:
             "allow_unknown": bool(allow_unknown),
             },
         )
-        self._commit_charge_route(best_route["target_pos"], hold_steps=3)
+        self._commit_charge_route(best_route["target_pos"], hold_steps=6)
         return best_route
 
     def _count_neighbor_cells(self, pos, radius, cell_value):
@@ -987,7 +1055,7 @@ class Preprocessor:
             state["dock_mode"] = bool(charge["dock_mode"])
             return state
 
-        if explore["mode"] == "expand_frontier":
+        if explore["mode"] in ("expand_frontier", "post_charge_release", "recenter"):
             state["mode_name"] = "expand"
             state["clean_mode"] = False
             state["expand_mode"] = True
@@ -1038,6 +1106,13 @@ class Preprocessor:
 
             if next_npc_dist is not None and next_npc_dist <= 1:
                 continue
+            if dock_mode and not preferred_action:
+                if next_dist > current_dist:
+                    continue
+                if current_dist <= 3 and next_dist >= current_dist and next_pos != target_pos:
+                    continue
+                if current_dist <= 2 and next_l1 >= current_l1 and next_pos != target_pos:
+                    continue
             if strict_progress and not preferred_action:
                 if progress < 0:
                     continue
@@ -1054,9 +1129,9 @@ class Preprocessor:
                 score -= 12.0 if dock_mode else 7.0
 
             if next_pos == target_pos:
-                score += 60.0 if dock_mode else 30.0
+                score += 80.0 if dock_mode else 30.0
             elif dock_mode and next_dist <= 1:
-                score += 18.0
+                score += 24.0
 
             if target_action is not None and action == int(target_action):
                 score += 16.0 if dock_mode else 10.0
@@ -1147,6 +1222,579 @@ class Preprocessor:
 
         return best_action
 
+    def _is_valid_legal_action(self, action):
+        return (
+            action is not None
+            and 0 <= int(action) < len(self._legal_act)
+            and self._legal_act[int(action)]
+        )
+
+    def _estimate_charge_trip(self, quick_dist, target_dist, path_found, route_reliable, first_charge_phase):
+        target_dist = int(target_dist if target_dist is not None else quick_dist)
+        # First charge failures are still the dominant loss mode, so estimate the return
+        # trip with a larger safety margin and let the agent turn back earlier.
+        trip_dist = float(target_dist) + (7.0 if first_charge_phase else 4.0)
+        if first_charge_phase and target_dist >= 6:
+            trip_dist += 2.0
+        if not path_found:
+            trip_dist += float(
+                np.clip(
+                    quick_dist * (0.84 if first_charge_phase else 0.60) + (14.0 if first_charge_phase else 6.0),
+                    16.0 if first_charge_phase else 10.0,
+                    36.0 if first_charge_phase else 18.0,
+                )
+            )
+        elif not route_reliable:
+            trip_dist += float(
+                np.clip(
+                    quick_dist * (0.56 if first_charge_phase else 0.35) + (8.0 if first_charge_phase else 4.0),
+                    12.0 if first_charge_phase else 8.0,
+                    24.0 if first_charge_phase else 16.0,
+                )
+            )
+        elif target_dist >= 10:
+            trip_dist += 2.0
+        if first_charge_phase and target_dist >= 12:
+            trip_dist += 3.0
+        return trip_dist
+
+    def _resolve_charge_plan(self, target_pos, quick_dist, preferred_target=None, allow_unknown_fallback=False):
+        target_dist = int(quick_dist)
+        route_source = "quick"
+        target_action = None
+        path_found = False
+        route_reliable = False
+
+        route = self._get_best_route_to_charger(allow_unknown=False, preferred_target=preferred_target)
+        if route is None and preferred_target is not None:
+            route = self._get_best_route_to_charger(allow_unknown=False)
+        if route is not None:
+            target_pos = route["target_pos"]
+            target_dist = int(route["path_steps"])
+            target_action = route["first_action"]
+            path_found = True
+            route_reliable = True
+            route_source = "planned_safe"
+        elif allow_unknown_fallback:
+            route = self._get_best_route_to_charger(allow_unknown=True, preferred_target=preferred_target)
+            if route is None and preferred_target is not None:
+                route = self._get_best_route_to_charger(allow_unknown=True)
+            if route is not None:
+                target_pos = route["target_pos"]
+                target_dist = int(route["path_steps"])
+                target_action = route["first_action"]
+                path_found = True
+                route_reliable = False
+                route_source = "planned_unknown"
+
+        if target_action is None:
+            target_action = self._choose_action_towards(target_pos)
+            if target_action is not None and not path_found:
+                route_source = "greedy"
+
+        return {
+            "target_pos": target_pos,
+            "target_action": target_action,
+            "target_dist": int(target_dist),
+            "path_found": bool(path_found),
+            "route_reliable": bool(route_reliable),
+            "route_source": route_source,
+        }
+
+    def _get_charge_activation_buffer(
+        self,
+        target_dist,
+        path_found,
+        route_reliable,
+        first_charge_phase,
+        current_visit,
+        step_limit=0,
+    ):
+        buffer_value = max(28, int(self.battery_max * 0.16))
+        buffer_value += min(16, max(0, int(target_dist)) // 2)
+        if first_charge_phase:
+            # Reserve extra battery for the first docking attempt, because a miss here
+            # usually collapses the whole episode score.
+            buffer_value += 14
+            if step_limit > 0 and self.step_no >= max(step_limit - 20, 44):
+                buffer_value += 8
+        else:
+            if self.charge_count >= 2:
+                buffer_value += min(6, int(self.charge_count))
+            if self.step_no >= 700:
+                buffer_value += 5
+            elif self.step_no >= 500:
+                buffer_value += 3
+            elif self.step_no >= 320:
+                buffer_value += 1
+
+        if current_visit >= 10:
+            buffer_value += 2
+        if self.nearest_npc_dist <= 2:
+            buffer_value += 6
+        elif self.nearest_npc_dist <= 4:
+            buffer_value += 3
+        if not path_found:
+            buffer_value += 12
+        elif not route_reliable:
+            buffer_value += 7
+        return int(min(self.battery_max - 1, buffer_value))
+
+    def _build_charge_guidance_core(
+        self,
+        first_charge_phase,
+        target_pos,
+        quick_dist,
+        soft_radius,
+        hard_radius,
+        current_visit,
+        locked_target=None,
+    ):
+        first_charge_out_radius = 0
+        first_charge_step_limit = 0
+        if first_charge_phase:
+            # The first charging cycle is the hardest constraint, so cap outward range
+            # and step budget more aggressively than later cycles.
+            first_charge_out_radius = int(np.clip(max(7, soft_radius - 7), 7, 9))
+            first_charge_step_limit = 74
+            if quick_dist >= 24:
+                first_charge_step_limit = min(first_charge_step_limit, 68)
+            elif quick_dist >= 16:
+                first_charge_step_limit = min(first_charge_step_limit, 70)
+            if self.nearest_npc_dist <= 2:
+                first_charge_step_limit = min(first_charge_step_limit, 68)
+            elif current_visit >= 10:
+                first_charge_step_limit = min(first_charge_step_limit, 70)
+
+        allow_unknown_fallback = False
+        if first_charge_phase:
+            # When the safe path is missing, switch to broader charger search earlier
+            # instead of waiting until the battery margin is already exhausted.
+            allow_unknown_fallback = bool(
+                self.return_to_charge_mode
+                or self.step_no >= max(first_charge_step_limit - 24, 42)
+                or quick_dist <= first_charge_out_radius + 8
+                or self.remaining_charge <= max(72, int(self.battery_max * 0.40))
+            )
+        else:
+            allow_unknown_fallback = True
+
+        plan = self._resolve_charge_plan(
+            target_pos,
+            quick_dist,
+            preferred_target=locked_target if first_charge_phase else None,
+            allow_unknown_fallback=allow_unknown_fallback,
+        )
+        target_pos = plan["target_pos"]
+        target_action = plan["target_action"]
+        target_dist = int(plan["target_dist"])
+        path_found = bool(plan["path_found"])
+        route_reliable = bool(plan["route_reliable"])
+        route_source = plan["route_source"]
+        recovery_mode = ""
+
+        reroute_stall_threshold = 5 if route_reliable else 4
+        last_progress = None
+        if self.last_charger_route_dist < 200.0:
+            last_progress = float(self.last_charger_route_dist) - float(target_dist)
+        committed_route = bool(self._is_charge_route_committed(target_pos))
+        allow_reroute = (
+            (not committed_route)
+            or (last_progress is not None and last_progress <= -1.0)
+            or self._charge_progress_stall_steps >= reroute_stall_threshold + 2
+        )
+        if (
+            self.return_to_charge_mode
+            and target_pos is not None
+            and target_dist > 2
+            and self._charge_progress_stall_steps >= reroute_stall_threshold
+            and allow_reroute
+        ):
+            self._charge_route_cache = None
+            self._clear_charge_route_commit()
+            reroute = self._resolve_charge_plan(
+                target_pos,
+                quick_dist,
+                preferred_target=locked_target if first_charge_phase else None,
+                allow_unknown_fallback=True,
+            )
+            if reroute["target_action"] is not None:
+                target_pos = reroute["target_pos"]
+                target_action = reroute["target_action"]
+                target_dist = int(reroute["target_dist"])
+                path_found = bool(reroute["path_found"])
+                route_reliable = bool(reroute["route_reliable"])
+                route_source = reroute["route_source"]
+                recovery_mode = "reroute"
+
+        reroute_stall_threshold = 5 if route_reliable else 4
+        first_charge_route_risky = bool(
+            first_charge_phase
+            and ((not path_found) or (not route_reliable) or route_source in ("planned_unknown", "greedy"))
+        )
+        dock_radius = int(np.clip(max(4, soft_radius // 3 + (1 if path_found else 0)), 4, 6))
+        if first_charge_phase:
+            dock_radius = int(np.clip(max(dock_radius, 6), 5, 6))
+        near_dock_threshold = max(dock_radius, 5 if route_reliable else 6)
+        if first_charge_phase:
+            # Enter charger-zone control earlier in the first cycle so the policy stops
+            # spending the last safe battery on exploration noise.
+            near_dock_threshold = max(near_dock_threshold, 8 if first_charge_route_risky else 7)
+        final_dock_threshold = 2
+        if first_charge_phase:
+            final_dock_threshold = 5 if first_charge_route_risky else 4
+        elif (not route_reliable) or self._charge_progress_stall_steps >= 2:
+            final_dock_threshold = 3
+        final_dock_threshold = min(final_dock_threshold, near_dock_threshold)
+        activation_buffer = self._get_charge_activation_buffer(
+            target_dist,
+            path_found,
+            route_reliable,
+            first_charge_phase,
+            current_visit,
+            step_limit=first_charge_step_limit,
+        )
+        if route_source == "planned_unknown":
+            activation_buffer += 6 if first_charge_phase else 6
+        elif route_source == "greedy":
+            activation_buffer += 8 if first_charge_phase else 8
+        if first_charge_phase:
+            # Inflate the activation budget during the first cycle so return mode starts
+            # while there is still enough energy for reroute plus final docking jitter.
+            if not path_found:
+                activation_buffer += 14
+            elif not route_reliable:
+                activation_buffer += 10
+            if route_source == "greedy":
+                activation_buffer += 6
+            if self.step_no >= max(first_charge_step_limit - 28, 40):
+                activation_buffer += 8
+        activation_buffer = int(min(self.battery_max - 1, activation_buffer))
+        release_buffer = int(min(self.battery_max - 1, max(activation_buffer + 18, int(self.battery_max * 0.40))))
+        battery_trip = self._estimate_charge_trip(
+            quick_dist,
+            target_dist,
+            path_found,
+            route_reliable,
+            first_charge_phase,
+        )
+        if route_source == "planned_unknown":
+            battery_trip += 5.0 if first_charge_phase else 4.0
+        elif route_source == "greedy":
+            battery_trip += 6.0 if first_charge_phase else 6.0
+        if first_charge_phase:
+            # Penalize weak route quality more strongly here because first-charge misses
+            # are much more expensive than giving up a few exploration steps.
+            if not path_found:
+                battery_trip += 12.0
+            elif not route_reliable:
+                battery_trip += 8.0
+            if route_source == "greedy":
+                battery_trip += 4.0
+            if target_dist >= max(first_charge_out_radius - 1, 6):
+                battery_trip += 4.0
+        battery_margin = int(self.remaining_charge - battery_trip)
+        first_charge_budget_buffer = 0
+        first_charge_budget_margin = None
+        if first_charge_phase:
+            first_charge_budget_buffer = int(min(self.battery_max - 1, activation_buffer + 12))
+            first_charge_budget_margin = int(battery_margin - first_charge_budget_buffer)
+
+        just_recharged = self._did_charge_this_step(target_dist)
+        if just_recharged:
+            self._handle_charge_success()
+
+        charge_ready_release = bool(
+            (not first_charge_phase)
+            and self.return_to_charge_mode
+            and self.charge_count > 0
+            and target_dist <= near_dock_threshold + 1
+            and battery_margin >= max(release_buffer, activation_buffer + 12)
+            and (
+                self.remaining_charge >= self.battery_max - 1
+                or target_dist <= final_dock_threshold
+                or self._charge_progress_stall_steps >= 2
+            )
+        )
+
+        should_return = False
+        reason = ""
+        if just_recharged:
+            should_return = False
+            reason = "charge_success_release"
+        elif charge_ready_release:
+            should_return = False
+            reason = "charge_buffer_release"
+            self._apply_post_charge_sequence()
+        elif self.return_to_charge_mode:
+            should_return = True
+            reason = "first_charge_hold_return" if first_charge_phase else "hold_return"
+        elif first_charge_phase:
+            # During the first cycle, any sign of risky routing should flip into return
+            # mode early; the goal is "charge first, optimize score later".
+            risky_return_step = max(first_charge_step_limit - (28 if first_charge_route_risky else 24), 42)
+            risky_out_radius = max(first_charge_out_radius - (1 if first_charge_route_risky else 0), 6)
+            if battery_margin <= activation_buffer:
+                should_return = True
+                reason = "first_charge_budget_return"
+            elif (
+                first_charge_route_risky
+                and target_dist >= max(risky_out_radius - 1, 5)
+                and battery_margin <= activation_buffer + (14 if not path_found else 12)
+            ):
+                should_return = True
+                reason = "first_charge_risky_route_return"
+            elif (
+                (not path_found)
+                and self.step_no >= risky_return_step
+                and target_dist >= max(risky_out_radius - 2, 5)
+            ):
+                should_return = True
+                reason = "first_charge_pathless_return"
+            elif (
+                route_source == "greedy"
+                and target_dist >= max(risky_out_radius - 1, 5)
+                and battery_margin <= activation_buffer + 16
+            ):
+                should_return = True
+                reason = "first_charge_greedy_return"
+            elif (
+                self.step_no >= risky_return_step
+                and target_dist >= risky_out_radius
+                and (first_charge_route_risky or battery_margin <= activation_buffer + 12)
+            ):
+                should_return = True
+                reason = "first_charge_route_return"
+            elif self.step_no >= first_charge_step_limit and target_dist >= max(4, first_charge_out_radius - 2):
+                should_return = True
+                reason = "first_charge_step_limit"
+            elif target_dist >= risky_out_radius and battery_margin <= activation_buffer + (
+                10 if first_charge_route_risky else 12
+            ):
+                should_return = True
+                reason = "first_charge_radius_return"
+        else:
+            if target_dist > hard_radius:
+                should_return = True
+                reason = "radius_return"
+            elif not path_found and target_dist > soft_radius:
+                should_return = True
+                reason = "route_uncertain_return"
+            elif not route_reliable and battery_margin <= activation_buffer + (10 if route_source == "greedy" else 8):
+                should_return = True
+                reason = "risky_budget_return"
+            elif battery_margin <= activation_buffer:
+                should_return = True
+                reason = "budget_return"
+            elif self.charge_count >= 2 and self.step_no >= 520 and battery_margin <= activation_buffer + 6:
+                should_return = True
+                reason = "late_cycle_return"
+
+        self.return_to_charge_mode = bool(should_return)
+        if self.return_to_charge_mode:
+            self.post_charge_expand_until_step = -1
+            self._clear_post_charge_release()
+            self._clear_expand_focus()
+            if target_pos is not None and (
+                first_charge_phase or (not route_reliable) or target_dist <= near_dock_threshold + 1
+            ):
+                if first_charge_phase:
+                    lock_steps = 10 if (target_dist <= near_dock_threshold + 1 or first_charge_route_risky) else 6
+                else:
+                    lock_steps = 8 if ((not route_reliable) or target_dist <= near_dock_threshold + 1) else 5
+                self._lock_charge_target(target_pos, hold_steps=lock_steps)
+        else:
+            self._clear_charge_route_commit()
+            if not first_charge_phase:
+                self._clear_charge_target_lock()
+
+        dock_mode = bool(self.return_to_charge_mode and target_dist <= near_dock_threshold)
+        final_dock_mode = bool(self.return_to_charge_mode and target_dist <= final_dock_threshold)
+        force_action = None
+        control_actions = []
+        controller_mode = ""
+        if self.return_to_charge_mode:
+            dock_action = None
+            if target_pos is not None and target_dist <= near_dock_threshold + (1 if first_charge_route_risky else 0) and (
+                target_dist <= final_dock_threshold or (not path_found) or (not route_reliable)
+            ):
+                dock_action = self._choose_action_towards(target_pos)
+                if self._is_valid_legal_action(dock_action):
+                    target_action = int(dock_action)
+                    if recovery_mode == "" and target_dist > final_dock_threshold:
+                        recovery_mode = "approach"
+
+            preferred_action = int(target_action) if self._is_valid_legal_action(target_action) else None
+            strict_progress = bool(final_dock_mode or (dock_mode and self._charge_progress_stall_steps >= 3))
+            ranked_actions = self._rank_charge_actions(
+                target_pos,
+                target_action=preferred_action,
+                dock_mode=dock_mode,
+                strict_progress=strict_progress,
+            )
+            if not ranked_actions:
+                ranked_actions = self._rank_charge_actions(
+                    target_pos,
+                    target_action=preferred_action,
+                    dock_mode=dock_mode,
+                    strict_progress=False,
+                )
+            if preferred_action is not None and preferred_action not in ranked_actions:
+                ranked_actions = [preferred_action] + ranked_actions
+
+            if final_dock_mode:
+                controller_mode = "final_dock"
+                limit = 3
+                commit_dist = 3 if first_charge_phase else 2
+                if target_dist <= commit_dist:
+                    if self._is_valid_legal_action(dock_action):
+                        force_action = int(dock_action)
+                    elif ranked_actions:
+                        force_action = int(ranked_actions[0])
+            elif dock_mode:
+                controller_mode = "near_dock"
+                limit = 3
+                # Near the charger, promote the direct docking action so the final steps
+                # are mostly rule-driven instead of policy-driven.
+                if self._is_valid_legal_action(dock_action) and (
+                    first_charge_phase
+                    or (not route_reliable)
+                    or self._charge_progress_stall_steps >= 1
+                    or target_dist <= max(final_dock_threshold + 1, 3)
+                ):
+                    force_action = int(dock_action)
+                    if first_charge_phase or self._charge_progress_stall_steps >= 1:
+                        limit = 1 if target_dist <= max(final_dock_threshold + 1, 3) else 2
+                    else:
+                        limit = 2
+            elif recovery_mode == "reroute" or self._charge_progress_stall_steps >= reroute_stall_threshold:
+                controller_mode = "return_recovery"
+                limit = 4 if route_reliable else 5
+            else:
+                controller_mode = "return"
+                limit = 4 if route_reliable else 5
+
+            control_actions = ranked_actions[:limit]
+            if force_action is not None and force_action not in control_actions:
+                control_actions = [int(force_action)] + [action for action in control_actions if action != int(force_action)]
+                control_actions = control_actions[:limit]
+
+        urgency = 0.0
+        if self.return_to_charge_mode:
+            shortfall = max(0.0, activation_buffer - battery_margin) / max(float(activation_buffer), 1.0)
+            stall_pressure = min(float(self._charge_progress_stall_steps) / 6.0, 1.0)
+            dock_pressure = 1.0 - min(float(target_dist) / max(float(near_dock_threshold + 1), 1.0), 1.0)
+            urgency = float(np.clip(max(shortfall, stall_pressure * 0.6, dock_pressure * 0.7), 0.25, 1.0))
+            if controller_mode == "near_dock":
+                urgency = max(urgency, 0.62 if route_reliable else 0.58)
+            elif controller_mode == "final_dock":
+                urgency = max(urgency, 0.78 if route_reliable else 0.72)
+            if first_charge_phase and controller_mode == "near_dock":
+                urgency = max(urgency, 0.70 if first_charge_route_risky else 0.64)
+            elif first_charge_phase and controller_mode == "final_dock":
+                urgency = max(urgency, 0.84 if first_charge_route_risky else 0.80)
+
+        first_charge_stage = "explore"
+        if self.return_to_charge_mode:
+            first_charge_stage = "dock" if dock_mode else "return"
+
+        return {
+            "should_return": self.return_to_charge_mode,
+            "reason": reason,
+            "target_pos": target_pos,
+            "target_action": target_action,
+            "target_dist": target_dist,
+            "battery_margin": battery_margin,
+            "activation_buffer": activation_buffer,
+            "release_buffer": release_buffer,
+            "urgency": urgency,
+            "path_found": path_found,
+            "soft_radius": soft_radius,
+            "hard_radius": hard_radius,
+            "dock_mode": dock_mode,
+            "dock_radius": dock_radius,
+            "return_mode": "dock" if dock_mode else ("return" if self.return_to_charge_mode else ""),
+            "recovery_mode": recovery_mode,
+            "controller_mode": controller_mode,
+            "force_action": force_action,
+            "control_actions": control_actions,
+            "route_source": route_source,
+            "route_reliable": route_reliable,
+            "first_charge_phase": bool(first_charge_phase),
+            "first_charge_stage": first_charge_stage,
+            "first_charge_budget_buffer": int(first_charge_budget_buffer),
+            "first_charge_budget_margin": (
+                None if first_charge_budget_margin is None else int(first_charge_budget_margin)
+            ),
+            "first_charge_step_limit": int(first_charge_step_limit),
+            "first_charge_out_radius": int(first_charge_out_radius),
+            "charge_rule_control": bool(self.return_to_charge_mode),
+            "charge_stall_steps": int(self._charge_progress_stall_steps),
+        }
+
+    def _make_explore_guidance(
+        self,
+        *,
+        active=False,
+        mode="",
+        reason="",
+        target_pos=None,
+        target_action=None,
+        target_dist=None,
+        desired_radius=0,
+        intensity=0.0,
+        path_found=False,
+        route_source="",
+        hold_active=False,
+        hold_steps_left=0,
+        post_charge_expand=False,
+        should_pull_back=False,
+        force_action=None,
+    ):
+        guidance = self._empty_explore_guidance()
+        guidance.update(
+            {
+                "active": bool(active),
+                "should_pull_back": bool(should_pull_back),
+                "mode": mode,
+                "reason": reason,
+                "target_pos": target_pos,
+                "target_action": target_action,
+                "target_dist": target_dist,
+                "force_action": force_action,
+                "soft_radius": 0,
+                "hard_radius": 0,
+                "desired_radius": int(desired_radius),
+                "intensity": float(intensity),
+                "path_found": bool(path_found),
+                "route_source": route_source,
+                "hold_active": bool(hold_active),
+                "hold_steps_left": int(hold_steps_left),
+                "post_charge_expand": bool(post_charge_expand),
+            }
+        )
+        if target_pos is not None:
+            guidance["target_dx"] = _signed_norm(target_pos[0] - self.cur_pos[0], self.GRID_SIZE)
+            guidance["target_dz"] = _signed_norm(target_pos[1] - self.cur_pos[1], self.GRID_SIZE)
+        if target_dist is not None:
+            guidance["target_dist"] = int(target_dist)
+        if target_action is not None:
+            guidance["target_action"] = int(target_action)
+        if force_action is not None:
+            guidance["force_action"] = int(force_action)
+        return guidance
+
+    def _build_first_charge_guidance(self, target_pos, quick_dist, soft_radius, hard_radius, current_visit, locked_target):
+        return self._build_charge_guidance_core(
+            first_charge_phase=True,
+            target_pos=target_pos,
+            quick_dist=quick_dist,
+            soft_radius=soft_radius,
+            hard_radius=hard_radius,
+            current_visit=current_visit,
+            locked_target=locked_target,
+        )
+
     def _build_charge_guidance(self):
         target_pos, quick_dist = self._nearest_point(self._charger_positions)
         if target_pos is None:
@@ -1170,490 +1818,24 @@ class Preprocessor:
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             current_visit = int(self.visit_count[hx, hz])
 
-        first_charge_out_radius = 0
-        first_charge_step_limit = 0
-        first_charge_unknown_plan_limit = 0
         if first_charge_phase:
-            first_charge_out_radius = int(
-                np.clip(
-                    max(
-                        8,
-                        min(
-                            hard_radius - 8,
-                            soft_radius - 5 + (1 if self.step_no >= 32 else 0) + (1 if self.step_no >= 64 else 0),
-                        ),
-                    ),
-                    8,
-                    10,
-                )
+            return self._build_first_charge_guidance(
+                target_pos=target_pos,
+                quick_dist=quick_dist,
+                soft_radius=soft_radius,
+                hard_radius=hard_radius,
+                current_visit=current_visit,
+                locked_target=locked_target,
             )
-            first_charge_step_limit = 92
-            if quick_dist >= 24:
-                first_charge_step_limit = min(first_charge_step_limit, 82)
-            if quick_dist >= 18:
-                first_charge_step_limit = min(first_charge_step_limit, 86)
-            if self.nearest_npc_dist <= 2:
-                first_charge_step_limit = min(first_charge_step_limit, 80)
-            elif current_visit >= 10:
-                first_charge_step_limit = min(first_charge_step_limit, 84)
-            first_charge_unknown_plan_limit = int(max(first_charge_out_radius + 1, 10))
-
-        target_action = None
-        path_found = False
-        route_reliable = False
-        target_dist = quick_dist
-        route_source = "quick"
-        needs_route_plan = (
-            quick_dist >= (max(first_charge_out_radius - 2, 1) if first_charge_phase else max(soft_radius - 4, 1))
-            or self.return_to_charge_mode
-            or (self.remaining_charge - quick_dist) <= max(26, int(self.battery_max * 0.18))
+        return self._build_charge_guidance_core(
+            first_charge_phase=False,
+            target_pos=target_pos,
+            quick_dist=quick_dist,
+            soft_radius=soft_radius,
+            hard_radius=hard_radius,
+            current_visit=current_visit,
+            locked_target=None,
         )
-        if needs_route_plan:
-            route = None
-            if first_charge_phase:
-                route = self._get_best_route_to_charger(
-                    allow_unknown=False,
-                    preferred_target=locked_target,
-                )
-                if route is not None:
-                    target_pos = route["target_pos"]
-                    target_dist = route["path_steps"]
-                    target_action = route["first_action"]
-                    path_found = True
-                    route_reliable = True
-                    route_source = "planned_safe"
-                elif self.return_to_charge_mode and quick_dist <= first_charge_unknown_plan_limit:
-                    route = self._get_best_route_to_charger(
-                        allow_unknown=True,
-                        preferred_target=locked_target,
-                    )
-                    if route is not None:
-                        target_pos = route["target_pos"]
-                        target_dist = route["path_steps"]
-                        target_action = route["first_action"]
-                        path_found = True
-                        route_source = "planned_unknown"
-            else:
-                route = self._get_best_route_to_charger(allow_unknown=True)
-                if route is not None:
-                    target_pos = route["target_pos"]
-                    target_dist = route["path_steps"]
-                    target_action = route["first_action"]
-                    path_found = True
-                    route_source = "planned"
-
-        if target_action is None:
-            target_action = self._choose_action_towards(target_pos)
-            if target_action is not None and not path_found:
-                route_source = "greedy"
-
-        in_charger_zone = target_dist <= 1
-        budget_target_dist = float(target_dist)
-        if first_charge_phase:
-            budget_target_dist += 4.0
-            if not path_found:
-                budget_target_dist += float(np.clip(max(10.0, quick_dist * 0.45 + 4.0), 10.0, 20.0))
-            elif not route_reliable:
-                budget_target_dist += float(np.clip(max(8.0, quick_dist * 0.35 + 3.0), 8.0, 16.0))
-            elif target_dist >= max(first_charge_out_radius - 1, 6):
-                budget_target_dist += 2.0
-        elif not route_reliable:
-            budget_target_dist += 4.0
-
-        base_buffer = max(18, int(self.battery_max * 0.15))
-        path_buffer = min(max(7, int(budget_target_dist * 0.50)), max(14, int(self.battery_max * 0.12)))
-        visit_buffer = min(10, current_visit // 2)
-        distance_buffer = min(8, max(0, int(max(0.0, budget_target_dist - soft_radius) * 0.20)))
-        trap_buffer = 2 if current_visit >= 14 else 0
-        if self.nearest_npc_dist <= 2:
-            npc_buffer = 8
-        elif self.nearest_npc_dist <= 4:
-            npc_buffer = 4
-        else:
-            npc_buffer = 0
-        if not path_found:
-            route_buffer = 8 if target_dist > soft_radius else 3
-        elif not route_reliable:
-            route_buffer = 6 if target_dist > soft_radius else 3
-        else:
-            route_buffer = 1 if target_dist > hard_radius else 0
-
-        activation_buffer = min(
-            self.battery_max - 1,
-            base_buffer + path_buffer + visit_buffer + distance_buffer + trap_buffer + npc_buffer + route_buffer,
-        )
-        if first_charge_phase:
-            first_charge_buffer = 8
-            if target_dist >= first_charge_out_radius + 4:
-                first_charge_buffer += 4
-            elif target_dist >= max(first_charge_out_radius + 2, 8):
-                first_charge_buffer += 2
-            if self.step_no >= max(first_charge_step_limit - 12, 84):
-                first_charge_buffer += 4
-            elif self.step_no >= max(first_charge_step_limit - 28, 64):
-                first_charge_buffer += 2
-            if current_visit >= 10:
-                first_charge_buffer += 2
-            if self.nearest_npc_dist <= 3:
-                first_charge_buffer += 2
-            if not route_reliable:
-                first_charge_buffer += 5 if path_found else 6
-            activation_buffer = min(self.battery_max - 1, activation_buffer + first_charge_buffer)
-        release_buffer = min(self.battery_max - 1, max(activation_buffer + 16, int(self.battery_max * 0.42)))
-        battery_margin = int(self.remaining_charge - budget_target_dist)
-        first_charge_budget_buffer = 0
-        first_charge_budget_margin = None
-        first_charge_budget_return_threshold = 0
-        if first_charge_phase:
-            first_charge_budget_buffer = activation_buffer + max(12, first_charge_out_radius // 2 + 4)
-            if target_dist >= first_charge_out_radius + 4:
-                first_charge_budget_buffer += 4
-            elif target_dist >= max(first_charge_out_radius + 2, 8):
-                first_charge_budget_buffer += 2
-            if not route_reliable:
-                first_charge_budget_buffer += 5 if path_found else 7
-            if current_visit >= 10:
-                first_charge_budget_buffer += 2
-            if self.step_no >= max(first_charge_step_limit - 16, 84):
-                first_charge_budget_buffer += 4
-            if self.nearest_npc_dist <= 3:
-                first_charge_budget_buffer += 2
-            first_charge_budget_buffer += 2
-            first_charge_budget_buffer = int(min(self.battery_max - 1, first_charge_budget_buffer))
-            first_charge_budget_margin = int(battery_margin - first_charge_budget_buffer)
-            first_charge_budget_return_threshold = 6 if route_reliable else 10
-        dock_radius = int(np.clip(max(4, soft_radius // 3 + (1 if path_found else 0)), 4, 6))
-        if first_charge_phase:
-            dock_radius = int(np.clip(max(dock_radius, 6), 5, 6))
-        return_radius = int(np.clip(max(soft_radius + 6, dock_radius + 8), 18, max(24, hard_radius + 4)))
-
-        just_recharged = (
-            self.charge_count > self.prev_charge_count
-            or (in_charger_zone and self.remaining_charge >= self.battery_max - 1)
-            or (self.remaining_charge - self.prev_remaining_charge) >= max(30, int(self.battery_max * 0.2))
-        )
-
-        if just_recharged:
-            self.prev_charge_cycle_explore_gain = max(0, self.explored_cells - self.charge_cycle_explore_start)
-            self.prev_charge_cycle_clean_gain = max(0, self.dirt_cleaned - self.charge_cycle_clean_start)
-            self.prev_charge_cycle_step_span = max(1, self.step_no - self.charge_cycle_start_step)
-            self.charge_cycle_explore_start = self.explored_cells
-            self.charge_cycle_clean_start = self.dirt_cleaned
-            self.charge_cycle_start_step = self.step_no
-            self._activate_post_charge_expand(18)
-            self._activate_expand_hold(14)
-            self._clear_expand_focus()
-            self._clear_charge_target_lock()
-            self._clear_charge_route_commit()
-            self.return_to_charge_mode = False
-            self._charge_progress_stall_steps = 0
-            self._last_charge_target_pos = None
-
-        radius_hard_exceeded = target_dist > hard_radius
-        radius_soft_exceeded = target_dist > soft_radius
-        radius_hard_trigger = bool(radius_hard_exceeded and ((not path_found) or current_visit >= 14))
-        soft_return_trigger = radius_soft_exceeded and battery_margin <= max(8, activation_buffer // 2)
-        mid_return_trigger = target_dist >= return_radius and battery_margin <= max(12, activation_buffer // 2)
-        first_charge_radius_trigger = False
-        first_charge_step_trigger = False
-        first_charge_route_trigger = False
-        if first_charge_phase:
-            first_charge_radius_trigger = bool(
-                target_dist >= max(first_charge_out_radius + 4, soft_radius + 2)
-                and battery_margin <= activation_buffer + max(18, first_charge_out_radius + 2)
-            )
-            first_charge_step_trigger = bool(
-                self.step_no >= first_charge_step_limit
-                and battery_margin <= activation_buffer + max(22, first_charge_out_radius + 4)
-            )
-            first_charge_route_trigger = bool(
-                (not route_reliable)
-                and target_dist >= max(first_charge_out_radius + 2, soft_radius - 1, 8)
-                and battery_margin <= activation_buffer + 16
-            )
-        reason = ""
-        if first_charge_phase:
-            if not self.return_to_charge_mode:
-                if first_charge_radius_trigger:
-                    self.return_to_charge_mode = True
-                    reason = "first_charge_radius_return"
-                elif first_charge_step_trigger:
-                    self.return_to_charge_mode = True
-                    reason = "first_charge_step_limit"
-                elif (
-                    first_charge_budget_margin is not None
-                    and first_charge_budget_margin <= first_charge_budget_return_threshold
-                ):
-                    self.return_to_charge_mode = True
-                    reason = "first_charge_budget_return"
-                elif battery_margin <= activation_buffer:
-                    self.return_to_charge_mode = True
-                    reason = "low_battery_return"
-                elif first_charge_route_trigger:
-                    self.return_to_charge_mode = True
-                    reason = "first_charge_route_uncertain"
-            else:
-                reason = "first_charge_hold_return"
-        else:
-            if not self.return_to_charge_mode:
-                if radius_hard_trigger:
-                    self.return_to_charge_mode = True
-                    reason = "radius_hard_limit"
-                elif not path_found and radius_soft_exceeded:
-                    self.return_to_charge_mode = True
-                    reason = "route_uncertain_return"
-                elif battery_margin <= activation_buffer:
-                    self.return_to_charge_mode = True
-                    reason = "low_battery_return"
-                elif mid_return_trigger:
-                    self.return_to_charge_mode = True
-                    reason = "mid_range_return"
-                elif soft_return_trigger and current_visit >= 2:
-                    self.return_to_charge_mode = True
-                    reason = "radius_soft_return"
-            elif just_recharged and battery_margin >= release_buffer:
-                self.return_to_charge_mode = False
-                reason = "recharged_release"
-            elif battery_margin >= release_buffer and target_dist <= max(soft_radius - 2, 1):
-                self.return_to_charge_mode = False
-                reason = "radius_release"
-            else:
-                reason = "return_mode_active"
-
-        if self.return_to_charge_mode and not just_recharged:
-            if target_action is None:
-                target_action = self._choose_action_towards(target_pos)
-            if first_charge_phase and target_pos is not None:
-                lock_target = tuple(target_pos)
-                if locked_target is None or tuple(locked_target) != lock_target:
-                    lock_steps = 6 if target_dist <= max(dock_radius + 1, 3) else 4
-                    self._lock_charge_target(lock_target, hold_steps=lock_steps)
-            self.post_charge_expand_until_step = -1
-        elif not self.return_to_charge_mode:
-            reason = ""
-
-        urgency = 0.0
-        recovery_mode = ""
-        dock_mode = False
-        if self.return_to_charge_mode:
-            final_dock_mode = bool(target_dist <= 2)
-            radius_reference = first_charge_out_radius if first_charge_phase else soft_radius
-            battery_shortfall = max(0.0, activation_buffer - battery_margin) / max(activation_buffer + 1, 1)
-            radius_shortfall = max(0.0, target_dist - radius_reference) / max(hard_radius - radius_reference, 1)
-            route_risk = 0.28 if not path_found else (0.12 if not route_reliable else 0.0)
-            stall_risk = 0.16 if self._charge_progress_stall_steps >= 4 else (0.08 if self._charge_progress_stall_steps >= 3 else 0.0)
-            urgency = float(np.clip(max(battery_shortfall, radius_shortfall, route_risk, stall_risk), 0.0, 1.0))
-
-            dock_local_threshold = 2
-            near_dock_threshold = 2 if first_charge_phase else 3
-            reroute_stall_threshold = 4 if route_reliable else 3
-            last_progress = None
-            if self.last_charger_route_dist < 200.0:
-                last_progress = float(self.last_charger_route_dist) - float(target_dist)
-            committed_route = bool(self._is_charge_route_committed(target_pos))
-            allow_reroute = (
-                (not committed_route)
-                or (last_progress is not None and last_progress <= -1.0)
-                or self._charge_progress_stall_steps >= reroute_stall_threshold + 2
-            )
-            if (
-                self._charge_progress_stall_steps >= reroute_stall_threshold
-                and target_dist > dock_local_threshold
-                and allow_reroute
-            ):
-                recovery_mode = "reroute"
-                self._charge_route_cache = None
-                self._clear_charge_route_commit()
-                recovery_route = self._get_best_route_to_charger(
-                    allow_unknown=False,
-                    preferred_target=locked_target if first_charge_phase else None,
-                )
-                if recovery_route is not None:
-                    target_pos = recovery_route["target_pos"]
-                    target_dist = recovery_route["path_steps"]
-                    target_action = recovery_route["first_action"]
-                    path_found = True
-                    route_reliable = True
-                    route_source = "planned_recovery_safe"
-                elif first_charge_phase:
-                    if locked_target is not None:
-                        self._clear_charge_target_lock()
-                        locked_target = None
-                    recovery_route = self._get_best_route_to_charger(allow_unknown=False)
-                    if recovery_route is not None:
-                        target_pos = recovery_route["target_pos"]
-                        target_dist = recovery_route["path_steps"]
-                        target_action = recovery_route["first_action"]
-                        path_found = True
-                        route_reliable = True
-                        route_source = "planned_recovery_safe"
-                    else:
-                        if quick_dist <= first_charge_unknown_plan_limit:
-                            recovery_route = self._get_best_route_to_charger(allow_unknown=True)
-                            if recovery_route is not None:
-                                target_pos = recovery_route["target_pos"]
-                                target_dist = recovery_route["path_steps"]
-                                target_action = recovery_route["first_action"]
-                                path_found = True
-                                route_reliable = False
-                                route_source = "planned_recovery_unknown"
-                            else:
-                                path_found = False
-                                route_reliable = False
-                                if target_dist <= max(dock_radius + 1, 3):
-                                    local_action = self._choose_action_towards(target_pos)
-                                    if local_action is not None:
-                                        target_action = local_action
-                                        route_source = "recovery_local"
-                                else:
-                                    if target_action is None:
-                                        target_action = self._choose_action_towards(target_pos)
-                                    route_source = "recovery_hold"
-                        else:
-                            path_found = False
-                            route_reliable = False
-                            if target_action is None:
-                                target_action = self._choose_action_towards(target_pos)
-                            route_source = "recovery_hold"
-                else:
-                    recovery_route = self._get_best_route_to_charger(allow_unknown=True)
-                    if recovery_route is not None:
-                        target_pos = recovery_route["target_pos"]
-                        target_dist = recovery_route["path_steps"]
-                        target_action = recovery_route["first_action"]
-                        path_found = True
-                        route_source = "planned_recovery_unknown"
-            elif self._charge_progress_stall_steps >= 3 and final_dock_mode:
-                recovery_mode = "dock"
-                dock_action = self._choose_action_towards(target_pos)
-                if dock_action is not None:
-                    target_action = dock_action
-                    route_source = "dock_local"
-
-            if (
-                first_charge_phase
-                and target_dist <= near_dock_threshold
-                and (target_dist <= 1 or (not path_found) or (not route_reliable))
-            ):
-                dock_action = self._choose_action_towards(target_pos)
-                if dock_action is not None:
-                    target_action = dock_action
-                    if recovery_mode == "":
-                        recovery_mode = "approach"
-                    if not path_found:
-                        route_source = "dock_local"
-
-            dock_mode = bool(target_dist <= dock_radius)
-            if dock_mode:
-                dock_pressure = max(0.0, dock_radius - target_dist + 1) / max(dock_radius, 1)
-                urgency = float(np.clip(max(urgency, 0.55 + 0.30 * dock_pressure), 0.0, 1.0))
-            elif first_charge_phase:
-                urgency = float(np.clip(max(urgency, 0.22), 0.0, 1.0))
-
-        first_charge_stage = ""
-        if first_charge_phase:
-            if dock_mode:
-                first_charge_stage = "dock"
-            elif self.return_to_charge_mode:
-                first_charge_stage = "return"
-            else:
-                first_charge_stage = "explore"
-        target_action_valid = bool(
-            target_action is not None and 0 <= int(target_action) < len(self._legal_act) and self._legal_act[int(target_action)]
-        )
-        controller_mode = ""
-        force_action = None
-        control_actions = []
-        if self.return_to_charge_mode:
-            preferred_action = int(target_action) if target_action_valid else None
-            reliable_return = bool(route_reliable and path_found)
-            final_dock_mode = bool(target_dist <= 2)
-            close_control = bool(final_dock_mode or self._charge_progress_stall_steps >= 4)
-            strict_progress = bool(final_dock_mode)
-            ranked_actions = self._rank_charge_actions(
-                target_pos,
-                target_action=preferred_action,
-                dock_mode=dock_mode,
-                strict_progress=strict_progress,
-            )
-            if not ranked_actions:
-                ranked_actions = self._rank_charge_actions(
-                    target_pos,
-                    target_action=preferred_action,
-                    dock_mode=dock_mode,
-                    strict_progress=False,
-                )
-            if preferred_action is not None and preferred_action not in ranked_actions:
-                ranked_actions = [preferred_action] + ranked_actions
-
-            force_top_action = False
-            if first_charge_phase:
-                if final_dock_mode:
-                    controller_mode = "first_charge_dock"
-                    limit = 2
-                    force_top_action = True
-                elif close_control:
-                    controller_mode = "first_charge_close"
-                    limit = 4
-                    force_top_action = bool(self._charge_progress_stall_steps >= 5)
-                elif reliable_return and preferred_action is not None:
-                    controller_mode = "first_charge_commit"
-                    limit = 3
-                    force_action = preferred_action
-                elif reliable_return:
-                    controller_mode = "first_charge_return"
-                    limit = 4
-                else:
-                    controller_mode = "first_charge_mix"
-                    limit = 5
-            else:
-                if final_dock_mode:
-                    controller_mode = "dock"
-                    limit = 2
-                    force_top_action = bool(self._charge_progress_stall_steps >= 3)
-                elif close_control and route_reliable:
-                    controller_mode = "return_close"
-                    limit = 3
-                    force_top_action = bool(self._charge_progress_stall_steps >= 5)
-                else:
-                    controller_mode = "return"
-                    limit = 4
-
-            control_actions = ranked_actions[:limit]
-            if force_action is None and force_top_action and control_actions:
-                force_action = int(control_actions[0])
-
-        return {
-            "should_return": self.return_to_charge_mode,
-            "reason": reason,
-            "target_pos": target_pos,
-            "target_action": target_action,
-            "target_dist": target_dist,
-            "battery_margin": battery_margin,
-            "activation_buffer": activation_buffer,
-            "release_buffer": release_buffer,
-            "urgency": urgency,
-            "path_found": path_found,
-            "soft_radius": soft_radius,
-            "hard_radius": hard_radius,
-            "dock_mode": dock_mode,
-            "dock_radius": dock_radius,
-            "return_mode": "dock" if dock_mode else ("return" if self.return_to_charge_mode else ""),
-            "recovery_mode": recovery_mode,
-            "controller_mode": controller_mode,
-            "force_action": force_action,
-            "control_actions": control_actions,
-            "route_source": route_source,
-            "route_reliable": bool(route_reliable),
-            "first_charge_phase": first_charge_phase,
-            "first_charge_stage": first_charge_stage,
-            "first_charge_budget_buffer": int(first_charge_budget_buffer),
-            "first_charge_budget_margin": None if first_charge_budget_margin is None else int(first_charge_budget_margin),
-            "first_charge_step_limit": int(first_charge_step_limit),
-            "first_charge_out_radius": int(first_charge_out_radius),
-            "charge_rule_control": bool(self.return_to_charge_mode),
-            "charge_stall_steps": int(self._charge_progress_stall_steps),
-        }
 
     def get_charge_guidance(self):
         return dict(self._charge_guidance)
@@ -1668,136 +1850,62 @@ class Preprocessor:
             self._explore_route_cache = None
             self._clear_expand_focus()
             return self._empty_explore_guidance()
-
         target_dist = int(guidance["target_dist"])
         soft_radius = int(guidance["soft_radius"])
         hard_radius = int(guidance["hard_radius"])
+        dock_radius = int(guidance["dock_radius"])
         battery_margin = int(guidance["battery_margin"])
         activation_buffer = int(guidance["activation_buffer"])
         release_buffer = int(guidance["release_buffer"])
-        first_charge_stage = guidance.get("first_charge_stage", "")
+        first_charge_phase = bool(guidance.get("first_charge_phase"))
 
         hx, hz = self.cur_pos
         current_visit = 0
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             current_visit = int(self.visit_count[hx, hz])
 
-        if bool(guidance.get("first_charge_phase")):
-            out_radius = int(guidance.get("first_charge_out_radius", max(8, soft_radius - 6)))
-            step_limit = int(guidance.get("first_charge_step_limit", 112))
-            desired_radius = int(np.clip(max(6, out_radius - 2), 6, max(6, hard_radius - 2)))
-            step_pressure = float(
-                np.clip(
-                    (self.step_no - max(step_limit - 24, 1)) / 24.0,
-                    0.0,
-                    1.0,
-                )
-            )
-            if (
-                first_charge_stage == "explore"
-                and target_dist < desired_radius
-                and battery_margin > activation_buffer + 10
-            ):
-                target_action = self._choose_action_away_from(guidance["target_pos"])
-                radius_gap = max(0, desired_radius - target_dist)
-                intensity = float(np.clip(0.18 + 0.04 * radius_gap + 0.08 * step_pressure, 0.18, 0.42))
-                self._explore_route_cache = None
-                self._clear_expand_focus()
-                return {
-                    "active": target_action is not None,
-                    "should_pull_back": False,
-                    "mode": "expand_frontier",
-                    "reason": "first_charge_expand",
-                    "target_pos": None,
-                    "target_action": target_action,
-                    "target_dist": max(0, desired_radius - target_dist),
-                    "target_dx": 0.0,
-                    "target_dz": 0.0,
-                    "soft_radius": soft_radius,
-                    "hard_radius": hard_radius,
-                    "desired_radius": desired_radius,
-                    "intensity": intensity,
-                    "path_found": False,
-                    "route_source": "local_outward",
-                    "hold_active": False,
-                    "hold_steps_left": 0,
-                    "post_charge_expand": False,
-                }
-            self._explore_route_cache = None
-            self._clear_expand_focus()
-            clean_guidance = self._empty_explore_guidance()
-            clean_guidance.update(
-                {
-                    "mode": "clean_local",
-                    "reason": "first_charge_hold",
-                    "desired_radius": desired_radius,
-                }
-            )
-            return clean_guidance
-
-        local_dirt_count = int(np.count_nonzero(self._view_map == 2))
-        explored_ratio = float(self.explored_cells) / float(self.GRID_SIZE * self.GRID_SIZE)
-        energy_headroom = max(0.0, float(battery_margin - activation_buffer))
-        energy_span = max(1.0, float(release_buffer - activation_buffer))
-        energy_ratio = float(np.clip(energy_headroom / energy_span, 0.0, 1.0))
-        hold_active = self._has_expand_hold()
-        post_charge_expand = self._has_post_charge_expand() and battery_margin >= max(10, activation_buffer // 2)
-        outward_ratio = float(np.clip(0.18 + 0.42 * min(explored_ratio * 1.8, 1.0) + 0.40 * energy_ratio, 0.0, 1.0))
-        desired_radius = int(
-            np.clip(
-                (soft_radius - 2) + round((hard_radius - soft_radius - 1) * outward_ratio),
-                max(10, soft_radius - 4),
-                max(soft_radius + 2, hard_radius - 1),
-            )
-        )
-        if post_charge_expand:
+        if first_charge_phase:
             desired_radius = int(
                 np.clip(
-                    max(desired_radius, soft_radius + max(5, int((hard_radius - soft_radius) * 0.75))),
-                    soft_radius + 2,
+                    max(6, int(guidance.get("first_charge_out_radius", max(8, soft_radius - 6))) - 1),
+                    6,
+                    max(6, hard_radius - 2),
+                )
+            )
+        else:
+            energy_headroom = max(0.0, float(battery_margin - activation_buffer))
+            energy_span = max(1.0, float(release_buffer - activation_buffer))
+            energy_ratio = float(np.clip(energy_headroom / energy_span, 0.0, 1.0))
+            desired_radius = int(
+                np.clip(
+                    soft_radius + round((hard_radius - soft_radius - 1) * (0.30 + 0.45 * energy_ratio)),
+                    max(8, soft_radius - 2),
                     max(soft_radius + 2, hard_radius - 1),
                 )
             )
 
-        overshoot = max(0, target_dist - desired_radius)
-        if target_dist > min(hard_radius - 1, desired_radius + 4):
-            intensity = float(np.clip(overshoot / max(hard_radius - desired_radius + 1, 1), 0.0, 1.0))
-            target_action = guidance["target_action"]
-            if target_action is None:
-                target_action = self._choose_action_towards(guidance["target_pos"])
-            return {
-                "active": target_action is not None,
-                "should_pull_back": True,
-                "mode": "recenter",
-                "reason": "safe_band_pullback",
-                "target_pos": guidance["target_pos"],
-                "target_action": target_action,
-                "target_dist": target_dist,
-                "target_dx": _signed_norm(guidance["target_pos"][0] - hx, self.GRID_SIZE),
-                "target_dz": _signed_norm(guidance["target_pos"][1] - hz, self.GRID_SIZE),
-                "soft_radius": soft_radius,
-                "hard_radius": hard_radius,
-                "desired_radius": desired_radius,
-                "intensity": max(0.35, intensity),
-                "path_found": bool(guidance["path_found"]),
-                "route_source": guidance["route_source"],
-                "hold_active": False,
-                "hold_steps_left": 0,
-                "post_charge_expand": False,
-            }
-
-        if local_dirt_count >= 3 and current_visit <= 8 and not post_charge_expand and not hold_active:
-            clean_guidance = self._empty_explore_guidance()
-            clean_guidance.update(
-                {
-                    "mode": "clean_local",
-                    "reason": "local_dirt_priority",
-                    "desired_radius": desired_radius,
-                }
+        post_charge_expand = self._has_post_charge_expand() and battery_margin >= max(activation_buffer + 6, 18)
+        if post_charge_expand:
+            desired_radius = int(
+                np.clip(
+                    max(desired_radius, soft_radius + 4),
+                    max(8, soft_radius),
+                    max(soft_radius + 2, hard_radius - 1),
+                )
             )
-            self._explore_route_cache = None
-            self._clear_expand_focus()
-            return clean_guidance
+
+        release_exit_radius = max(dock_radius + 1, 4)
+        post_charge_release = bool(
+            self._has_post_charge_release()
+            and battery_margin >= max(activation_buffer + 8, 18)
+        )
+        if post_charge_release and target_dist > release_exit_radius:
+            self._clear_post_charge_release()
+            post_charge_release = False
+
+        local_dirt_count = int(np.count_nonzero(self._view_map == 2))
+        hold_active = self._has_expand_hold()
+        budget_limit = int(max(desired_radius + 2, self.remaining_charge - max(activation_buffer, 12)))
 
         explore_target = None
         if hold_active or post_charge_expand:
@@ -1805,6 +1913,7 @@ class Preprocessor:
                 charger_pos=guidance["target_pos"],
                 desired_radius=desired_radius,
                 hard_radius=hard_radius,
+                budget_limit=budget_limit,
             )
             if explore_target is None and self._expand_focus_target is not None:
                 self._clear_expand_focus()
@@ -1815,84 +1924,135 @@ class Preprocessor:
                 desired_radius=desired_radius,
                 soft_radius=soft_radius,
                 hard_radius=hard_radius,
+                budget_limit=budget_limit,
             )
 
+        if post_charge_release:
+            force_action = self._choose_action_away_from(guidance["target_pos"])
+            if self._is_valid_legal_action(force_action):
+                hold_steps_left = max(0, self.post_charge_release_until_step - self.step_no + 1)
+                release_target_pos = None
+                release_target_action = int(force_action)
+                release_target_dist = max(0, desired_radius - target_dist)
+                release_reason = "post_charge_release"
+                release_path_found = False
+                release_route_source = "local_outward"
+
+                if explore_target is not None:
+                    release_target_pos = explore_target["target_pos"]
+                    if explore_target["target_action"] is not None:
+                        release_target_action = int(explore_target["target_action"])
+                    release_target_dist = int(explore_target["target_dist"])
+                    release_reason = explore_target["reason"]
+                    release_path_found = bool(explore_target["path_found"])
+                    release_route_source = "release_{}".format(explore_target["route_source"] or "greedy")
+                    if release_target_pos is not None:
+                        self._expand_focus_target = tuple(release_target_pos)
+                        self._expand_focus_reason = "post_charge_release"
+                else:
+                    self._explore_route_cache = None
+                    self._clear_expand_focus()
+
+                explore_guidance = self._make_explore_guidance(
+                    active=True,
+                    mode="post_charge_release",
+                    reason=release_reason,
+                    target_pos=release_target_pos,
+                    target_action=release_target_action,
+                    target_dist=release_target_dist,
+                    desired_radius=desired_radius,
+                    intensity=0.58 if explore_target is not None else 0.66,
+                    path_found=release_path_found,
+                    route_source=release_route_source,
+                    hold_active=True,
+                    hold_steps_left=hold_steps_left,
+                    post_charge_expand=True,
+                    force_action=int(force_action),
+                )
+                explore_guidance["soft_radius"] = soft_radius
+                explore_guidance["hard_radius"] = hard_radius
+                return explore_guidance
+
+            self._clear_post_charge_release()
+            post_charge_release = False
+
         if explore_target is None:
-            if post_charge_expand:
-                target_action = self._choose_action_away_from(guidance["target_pos"])
-                if target_action is not None:
-                    hold_steps_left = max(0, self.post_charge_expand_until_step - self.step_no + 1)
-                    return {
-                        "active": True,
-                        "should_pull_back": False,
-                        "mode": "expand_frontier",
-                        "reason": "post_charge_outward",
-                        "target_pos": None,
-                        "target_action": target_action,
-                        "target_dist": max(0, desired_radius - target_dist),
-                        "target_dx": 0.0,
-                        "target_dz": 0.0,
-                        "soft_radius": soft_radius,
-                        "hard_radius": hard_radius,
-                        "desired_radius": desired_radius,
-                        "intensity": 0.50,
-                        "path_found": False,
-                        "route_source": "local_outward",
-                        "hold_active": hold_active,
-                        "hold_steps_left": hold_steps_left,
-                        "post_charge_expand": True,
-                    }
-            fallback_guidance = self._empty_explore_guidance()
-            fallback_guidance.update(
-                {
-                    "mode": "clean_local" if local_dirt_count > 0 else "",
-                    "reason": "no_expand_target" if local_dirt_count == 0 else "local_dirt_fallback",
-                    "desired_radius": desired_radius,
-                }
+            should_recenter = bool(
+                (not first_charge_phase)
+                and target_dist <= max(dock_radius + 1, 4)
+                and battery_margin >= max(activation_buffer + 10, 18)
+                and (post_charge_expand or current_visit >= 6 or self.charge_count >= 2)
             )
+            recenter_action = self._choose_action_away_from(guidance["target_pos"]) if should_recenter else None
+            if self._is_valid_legal_action(recenter_action):
+                fallback = self._make_explore_guidance(
+                    active=True,
+                    mode="recenter",
+                    reason="leave_charger_zone",
+                    target_action=int(recenter_action),
+                    target_dist=max(1, desired_radius - target_dist),
+                    desired_radius=desired_radius,
+                    intensity=0.52 if post_charge_expand else 0.42,
+                    hold_active=hold_active,
+                    hold_steps_left=max(0, self.expand_hold_until_step - self.step_no + 1),
+                    post_charge_expand=post_charge_expand,
+                    force_action=int(recenter_action),
+                )
+                fallback["soft_radius"] = soft_radius
+                fallback["hard_radius"] = hard_radius
+                return fallback
+
+            self._explore_route_cache = None
             self._clear_expand_focus()
-            return fallback_guidance
+            fallback = self._make_explore_guidance(
+                active=False,
+                mode="clean_local" if local_dirt_count > 0 else "",
+                reason="local_clean" if local_dirt_count > 0 else "safe_zone",
+                desired_radius=desired_radius,
+            )
+            fallback["soft_radius"] = soft_radius
+            fallback["hard_radius"] = hard_radius
+            return fallback
+
+        new_focus_target = tuple(explore_target["target_pos"]) if explore_target["target_pos"] is not None else None
+        hold_steps = 10 if first_charge_phase else (14 if post_charge_expand else 12)
+        if (not hold_active) or (new_focus_target is not None and new_focus_target != self._expand_focus_target):
+            self._activate_expand_hold(hold_steps)
+        if new_focus_target is not None:
+            self._expand_focus_target = new_focus_target
+            self._expand_focus_reason = "post_charge_expand" if post_charge_expand else "expand_frontier"
 
         expand_gap = max(0, desired_radius - target_dist)
         intensity = float(
             np.clip(
                 0.22
-                + 0.36 * (expand_gap / max(desired_radius, 1))
-                + 0.20 * (1.0 if local_dirt_count == 0 else 0.0)
-                + (0.10 if post_charge_expand else 0.0)
-                + (0.06 if hold_active else 0.0),
-                0.0,
-                1.0,
+                + 0.30 * (expand_gap / max(desired_radius, 1))
+                + (0.12 if post_charge_expand else 0.0)
+                + (0.06 if local_dirt_count == 0 else 0.0)
+                + (0.04 if current_visit >= 8 else 0.0),
+                0.18,
+                0.72,
             )
         )
-        hold_steps = 18 if post_charge_expand else (16 if intensity >= 0.60 else 12)
-        new_focus_target = None if explore_target["target_pos"] is None else tuple(explore_target["target_pos"])
-        if (not hold_active) or (new_focus_target is not None and new_focus_target != self._expand_focus_target):
-            self._activate_expand_hold(hold_steps)
-        if new_focus_target is not None:
-            self._expand_focus_target = new_focus_target
-            self._expand_focus_reason = "post_charge_expand" if post_charge_expand else "expand_frontier_hold"
         hold_steps_left = max(0, self.expand_hold_until_step - self.step_no + 1)
-        return {
-            "active": explore_target["target_action"] is not None,
-            "should_pull_back": False,
-            "mode": "expand_frontier",
-            "reason": explore_target["reason"],
-            "target_pos": explore_target["target_pos"],
-            "target_action": explore_target["target_action"],
-            "target_dist": int(explore_target["target_dist"]),
-            "target_dx": _signed_norm(explore_target["target_pos"][0] - hx, self.GRID_SIZE),
-            "target_dz": _signed_norm(explore_target["target_pos"][1] - hz, self.GRID_SIZE),
-            "soft_radius": soft_radius,
-            "hard_radius": hard_radius,
-            "desired_radius": desired_radius,
-            "intensity": intensity,
-            "path_found": bool(explore_target["path_found"]),
-            "route_source": explore_target["route_source"],
-            "hold_active": True,
-            "hold_steps_left": hold_steps_left,
-            "post_charge_expand": post_charge_expand,
-        }
+        explore_guidance = self._make_explore_guidance(
+            active=explore_target["target_action"] is not None,
+            mode="expand_frontier",
+            reason=explore_target["reason"],
+            target_pos=explore_target["target_pos"],
+            target_action=explore_target["target_action"],
+            target_dist=int(explore_target["target_dist"]),
+            desired_radius=desired_radius,
+            intensity=intensity,
+            path_found=bool(explore_target["path_found"]),
+            route_source=explore_target["route_source"],
+            hold_active=True,
+            hold_steps_left=hold_steps_left,
+            post_charge_expand=post_charge_expand,
+        )
+        explore_guidance["soft_radius"] = soft_radius
+        explore_guidance["hard_radius"] = hard_radius
+        return explore_guidance
 
     def get_explore_guidance(self):
         return dict(self._explore_guidance)
@@ -2125,7 +2285,6 @@ class Preprocessor:
             "charge_return_mode": guidance.get("return_mode", ""),
             "charge_recovery_mode": guidance.get("recovery_mode", ""),
             "charge_controller_mode": guidance.get("controller_mode", ""),
-            "charge_force_action": guidance.get("force_action"),
             "charge_allowed_count": len(guidance.get("control_actions") or []),
             "soft_clean_radius": int(guidance["soft_radius"]),
             "hard_clean_radius": int(guidance["hard_radius"]),
@@ -2175,234 +2334,117 @@ class Preprocessor:
     def reward_process(self):
         cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
         guidance = self._charge_guidance
-        explore_guidance = self._explore_guidance
-        strategy = self._strategy_state
         first_charge_phase = bool(guidance.get("first_charge_phase"))
-        first_charge_stage = guidance.get("first_charge_stage", "")
-        recovery_mode = guidance.get("recovery_mode", "")
         first_charge_budget_margin = guidance.get("first_charge_budget_margin")
         if first_charge_budget_margin is not None:
             first_charge_budget_margin = int(first_charge_budget_margin)
-        first_charge_success = bool(self.charge_count > self.prev_charge_count and self.prev_charge_count <= 0)
+        new_explored_cells = max(0, self.explored_cells - self.prev_explored_cells)
+        charged_this_step = bool(self.charge_count > self.prev_charge_count)
+        first_charge_success = bool(charged_this_step and self.prev_charge_count <= 0)
         hx, hz = self.cur_pos
         current_visit = 0
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             current_visit = int(self.visit_count[hx, hz])
-        new_explored_cells = max(0, self.explored_cells - self.prev_explored_cells)
-        local_dirt_count = int(np.count_nonzero(self._view_map == 2))
 
-        cleaning_reward = 0.06 * cleaned_this_step
+        reward = -0.0025
+
+        cleaning_reward = 0.075 * cleaned_this_step
         if guidance["should_return"]:
-            if guidance["dock_mode"]:
-                cleaning_reward *= 0.12
-            elif guidance["battery_margin"] is not None and guidance["battery_margin"] <= max(10, guidance["activation_buffer"] // 2):
-                cleaning_reward *= 0.45
-            else:
-                cleaning_reward *= 0.40
-        elif guidance["battery_margin"] is not None and guidance["battery_margin"] < max(8, guidance["activation_buffer"] // 3):
-            cleaning_reward *= 0.75
-        elif strategy["clean_mode"] and local_dirt_count > 0:
-            cleaning_reward *= 1.08
-        elif strategy["expand_mode"]:
-            cleaning_reward *= 0.92
-        if first_charge_phase:
-            if guidance["should_return"]:
-                if guidance["dock_mode"] or first_charge_stage == "dock":
-                    cleaning_reward *= 0.85
-                else:
-                    cleaning_reward *= 0.74
-            elif first_charge_budget_margin is not None and first_charge_budget_margin <= 0:
-                cleaning_reward *= 0.82
+            cleaning_reward *= 0.18 if guidance["dock_mode"] else 0.35
+        reward += cleaning_reward
 
-        step_penalty = -0.0025
+        if not guidance["should_return"] and new_explored_cells > 0:
+            reward += 0.0040 * min(new_explored_cells, 6)
 
-        charge_reward = 0.0
-        if self.charge_count > self.prev_charge_count:
-            charge_reward += 0.4
+        if charged_this_step:
+            reward += 0.18
             if first_charge_success:
-                charge_reward += 0.58
+                reward += 0.95
                 if self.step_no <= 220:
-                    charge_reward += 0.10
+                    reward += 0.10
                 elif self.step_no <= 320:
-                    charge_reward += 0.06
+                    reward += 0.05
+
             cycle_explore_gain = int(self.prev_charge_cycle_explore_gain)
             cycle_clean_gain = int(self.prev_charge_cycle_clean_gain)
-            cycle_step_span = max(1, int(self.prev_charge_cycle_step_span))
-            if cycle_explore_gain <= 2 and cycle_clean_gain <= 4 and cycle_step_span <= 24:
-                charge_reward -= 0.16
-            elif cycle_explore_gain <= 4 and cycle_clean_gain <= 8:
-                charge_reward -= 0.10
-            elif cycle_explore_gain <= 8 and cycle_clean_gain <= 12:
-                charge_reward -= 0.05
-            elif cycle_explore_gain >= 18 or cycle_clean_gain >= 24:
-                charge_reward += 0.04
-        if first_charge_phase and guidance["battery_margin"] is not None:
-            if not guidance["should_return"] and first_charge_budget_margin is not None and first_charge_budget_margin < 0:
-                charge_reward -= 0.010
+            if cycle_explore_gain <= 2 and cycle_clean_gain <= 4:
+                reward -= 0.28
+            elif cycle_explore_gain <= 6 and cycle_clean_gain <= 10:
+                reward -= 0.12
+            elif cycle_explore_gain >= 24 or cycle_clean_gain >= 30:
+                reward += 0.08
+
+        if not guidance["should_return"]:
+            charger_dist = guidance.get("target_dist")
+            battery_margin = guidance.get("battery_margin")
+            activation_buffer = int(guidance.get("activation_buffer", 0))
+
+            if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 6:
+                reward -= 0.004 * min(current_visit - 5, 6)
+
             if (
-                not guidance["should_return"]
-                and guidance["target_dist"] is not None
-                and guidance["target_dist"] >= max(guidance["soft_radius"] - 1, 10)
-                and first_charge_budget_margin is not None
-                and first_charge_budget_margin <= max(4, guidance["soft_radius"] // 5)
+                charger_dist is not None
+                and battery_margin is not None
+                and int(battery_margin) >= activation_buffer + 10
+                and int(charger_dist) <= int(guidance.get("dock_radius", 0)) + 1
             ):
-                charge_reward -= 0.006
-            if (
-                not guidance["should_return"]
-                and first_charge_budget_margin is not None
-                and first_charge_budget_margin >= 8
-                and guidance["target_dist"] is not None
-                and guidance["target_dist"] <= max(guidance["soft_radius"], 10)
-            ):
-                charge_reward += 0.002
+                reward -= 0.018
+                if current_visit >= 4:
+                    reward -= 0.003 * min(current_visit - 3, 5)
 
         route_progress = None
         if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
             route_progress = self.last_charger_route_dist - self.charger_route_dist
 
-        survival_reward = 0.0
-        if guidance["battery_margin"] is not None:
-            safe_margin = max(10, guidance["activation_buffer"] // 2)
-            if guidance["should_return"]:
-                if guidance["battery_margin"] >= safe_margin:
-                    survival_reward += 0.003 if guidance["dock_mode"] else 0.0025
-                elif guidance["battery_margin"] >= 0:
-                    survival_reward += 0.0015
-                else:
-                    survival_reward -= 0.010 if guidance["dock_mode"] else 0.008
-                if recovery_mode == "dock" and guidance["battery_margin"] >= 0:
-                    survival_reward += 0.001
-            else:
-                if guidance["battery_margin"] >= safe_margin and current_visit <= 8:
-                    survival_reward += 0.002
-                elif guidance["battery_margin"] < max(6, guidance["activation_buffer"] // 3):
-                    survival_reward -= 0.004
-            if first_charge_phase:
-                if guidance["should_return"]:
-                    if first_charge_stage == "dock":
-                        if guidance["battery_margin"] >= max(3, safe_margin // 3):
-                            survival_reward += 0.003
-                        elif guidance["battery_margin"] < 0:
-                            survival_reward -= 0.008
-                    elif first_charge_stage == "return":
-                        if guidance["battery_margin"] >= max(4, safe_margin // 2):
-                            survival_reward += 0.002
-                        elif guidance["battery_margin"] < 0:
-                            survival_reward -= 0.006
-                elif first_charge_budget_margin is not None and first_charge_budget_margin < 0:
-                    survival_reward -= 0.004
-                elif first_charge_budget_margin is not None and first_charge_budget_margin >= 8 and current_visit <= 8:
-                    survival_reward += 0.002
-
-        if current_visit >= 12:
-            survival_reward -= 0.004 if guidance["should_return"] else 0.002
-
-        if route_progress is not None:
-            if guidance["should_return"]:
-                progress_scale = 0.012
-                regress_scale = 0.022
-                if guidance["dock_mode"]:
-                    progress_scale = 0.016
-                    regress_scale = 0.030
-                elif first_charge_phase:
-                    progress_scale = 0.014
-                    regress_scale = 0.024
-                if recovery_mode == "dock":
-                    progress_scale += 0.004
-                    regress_scale += 0.004
+        if guidance["should_return"]:
+            if route_progress is not None:
                 if route_progress > 0:
-                    charge_reward += progress_scale * min(route_progress, 2.0)
+                    progress_scale = 0.028 if guidance["dock_mode"] else 0.022
+                    reward += progress_scale * min(route_progress, 2.0)
                 elif route_progress < 0:
-                    charge_reward += regress_scale * max(route_progress, -2.0)
-            elif first_charge_phase and first_charge_budget_margin is not None:
-                budget_threshold = max(4, guidance["soft_radius"] // 5)
-                if first_charge_budget_margin <= budget_threshold:
-                    if route_progress > 0:
-                        charge_reward += 0.006 * min(route_progress, 2.0)
-                    elif route_progress < 0:
-                        charge_reward += 0.012 * max(route_progress, -2.0)
+                    regress_scale = 0.042 if guidance["dock_mode"] else 0.032
+                    reward += regress_scale * max(route_progress, -2.0)
 
-        if guidance["should_return"] and guidance["battery_margin"] is not None:
-            if guidance["battery_margin"] < 0:
-                charge_reward -= 0.05 if guidance["dock_mode"] else 0.04
-            elif guidance["battery_margin"] <= max(6, guidance["activation_buffer"] // 3):
-                charge_reward -= 0.010 if guidance["dock_mode"] else 0.008
+            battery_margin = guidance.get("battery_margin")
+            if battery_margin is not None and int(battery_margin) < 0:
+                reward -= 0.030 if guidance["dock_mode"] else 0.024
             if not guidance["path_found"]:
-                charge_reward -= 0.008 if recovery_mode == "reroute" else 0.003
-            if current_visit >= 10:
-                charge_reward -= 0.004 if guidance["dock_mode"] else 0.002
-            if guidance["dock_mode"]:
-                dock_dist = 0 if guidance["target_dist"] is None else int(guidance["target_dist"])
-                if dock_dist <= 1 and self.charge_count <= self.prev_charge_count:
-                    charge_reward -= 0.040
-                elif dock_dist <= max(3, int(guidance["dock_radius"]) - 1):
-                    if self.charge_count <= self.prev_charge_count:
-                        charge_reward -= 0.016 if recovery_mode == "dock" else 0.010
-                    if guidance["battery_margin"] <= 0:
-                        charge_reward -= 0.010
+                reward -= 0.004
 
-        npc_reward = 0.0
+            stall_steps = int(guidance.get("charge_stall_steps", 0))
+            if stall_steps >= 2:
+                reward -= 0.008 * min(stall_steps, 6)
+                if guidance["dock_mode"]:
+                    reward -= 0.004 * min(stall_steps, 4)
+
+            target_dist = guidance.get("target_dist")
+            if guidance["dock_mode"] and target_dist is not None and int(target_dist) <= 1 and not charged_this_step:
+                reward -= 0.035
+
+        if first_charge_phase:
+            if first_charge_budget_margin is not None:
+                if not guidance["should_return"] and first_charge_budget_margin <= 0:
+                    reward -= 0.032
+                elif not guidance["should_return"] and first_charge_budget_margin <= 6:
+                    reward -= 0.014
+                elif guidance["should_return"] and first_charge_budget_margin < -6:
+                    reward -= 0.010
+
+            if self.step_no >= 160:
+                reward -= 0.004
+            if self.step_no >= 220:
+                reward -= 0.008
+            if self.step_no >= 300:
+                reward -= 0.012
+
         if self.nearest_npc_dist <= 1:
-            npc_reward -= 0.05
+            reward -= 0.04
         elif self.nearest_npc_dist == 2:
-            npc_reward -= 0.02
-
+            reward -= 0.015
         if self.last_nearest_npc_dist <= 4:
             if self.nearest_npc_dist > self.last_nearest_npc_dist:
-                npc_reward += 0.01
+                reward += 0.006
             elif self.nearest_npc_dist < self.last_nearest_npc_dist:
-                npc_reward -= 0.01
+                reward -= 0.006
 
-        explore_reward = 0.0
-        if not guidance["should_return"]:
-            charger_dist = 200 if guidance["target_dist"] is None else int(guidance["target_dist"])
-            if new_explored_cells > 0:
-                if strategy["expand_mode"]:
-                    explore_reward += 0.0045 * min(new_explored_cells, 6)
-                else:
-                    explore_reward += 0.0025 * min(new_explored_cells, 4)
-
-            if explore_guidance["mode"] == "expand_frontier":
-                outward_progress = 0.0
-                if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
-                    outward_progress = self.charger_route_dist - self.last_charger_route_dist
-                    if outward_progress > 0:
-                        explore_reward += 0.008 * min(outward_progress, 2.0)
-                    elif outward_progress < 0 and explore_guidance["post_charge_expand"]:
-                        explore_reward += 0.012 * max(outward_progress, -2.0)
-                if self.last_explore_route_dist < 200.0 and self.explore_route_dist < 200.0:
-                    route_progress = self.last_explore_route_dist - self.explore_route_dist
-                    if route_progress > 0:
-                        explore_reward += 0.010 * min(route_progress, 2.0)
-                    elif route_progress < 0:
-                        explore_reward += 0.014 * max(route_progress, -2.0)
-                if explore_guidance["hold_active"]:
-                    explore_reward += 0.002
-                if explore_guidance["post_charge_expand"] and outward_progress <= 0 and new_explored_cells == 0:
-                    explore_reward -= 0.006
-                if current_visit >= 10:
-                    explore_reward -= 0.004
-                if local_dirt_count == 0 and new_explored_cells == 0:
-                    explore_reward -= 0.002
-            elif explore_guidance["mode"] == "recenter":
-                if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
-                    route_progress = self.last_charger_route_dist - self.charger_route_dist
-                    if route_progress > 0:
-                        explore_reward += 0.008 * min(route_progress, 2.0)
-                    elif route_progress < 0:
-                        explore_reward += 0.012 * max(route_progress, -2.0)
-                explore_reward -= 0.004 * max(0.4, explore_guidance["intensity"])
-            elif strategy["clean_mode"] and local_dirt_count == 0 and new_explored_cells == 0 and current_visit >= 10:
-                explore_reward -= 0.002
-
-            if (
-                charger_dist <= max(2, int(guidance["dock_radius"]))
-                and self.remaining_charge >= max(int(self.battery_max * 0.55), int(guidance["release_buffer"]))
-                and new_explored_cells == 0
-                and cleaned_this_step == 0
-            ):
-                explore_reward -= 0.006
-                if current_visit >= 4:
-                    explore_reward -= 0.004
-
-        return cleaning_reward + step_penalty + charge_reward + survival_reward + npc_reward + explore_reward
+        return reward

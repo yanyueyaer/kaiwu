@@ -6,7 +6,7 @@
 """
 Author: Tencent AI Arena Authors
 
-Simple MLP policy network for Robot Vacuum.
+CNN-enhanced policy network for Robot Vacuum.
 """
 
 import torch

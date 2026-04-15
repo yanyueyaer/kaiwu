@@ -81,14 +81,14 @@ class Agent(BaseAgent):
         rule_charge_control = self._build_rule_charge_control(prob, legal_arr)
         if rule_charge_control is not None:
             rule_prob = rule_charge_control["prob"]
-            force_action = rule_charge_control.get("force_action")
+            deterministic_action = rule_charge_control.get("deterministic_action")
             behavior_prob = rule_prob
-            if force_action is not None and 0 <= int(force_action) < len(rule_prob):
-                force_action = int(force_action)
+            if deterministic_action is not None and 0 <= int(deterministic_action) < len(rule_prob):
+                deterministic_action = int(deterministic_action)
                 behavior_prob = np.zeros_like(rule_prob, dtype=np.float32)
-                behavior_prob[force_action] = 1.0
-                rule_action = force_action
-                rule_d_action = force_action
+                behavior_prob[deterministic_action] = 1.0
+                rule_action = deterministic_action
+                rule_d_action = deterministic_action
             else:
                 rule_action = self._legal_sample(rule_prob, use_max=False)
                 rule_d_action = self._legal_sample(rule_prob, use_max=True)
@@ -222,31 +222,58 @@ class Agent(BaseAgent):
 
     def _apply_explore_guidance(self, prob, legal_action):
         guidance = self.preprocessor.get_explore_guidance()
+        if not guidance.get("active"):
+            return prob
+
         target_action = guidance.get("target_action")
-        if not guidance.get("active") or target_action is None:
-            return prob
-
-        if target_action >= len(legal_action) or legal_action[target_action] <= 0:
-            return prob
-
-        heuristic_prob = np.zeros_like(prob, dtype=np.float32)
-        heuristic_prob[target_action] = 1.0
-
+        force_action = guidance.get("force_action")
         mode_name = guidance.get("mode")
         intensity = float(np.clip(guidance.get("intensity", 0.0), 0.0, 1.0))
         hold_active = bool(guidance.get("hold_active"))
         post_charge_expand = bool(guidance.get("post_charge_expand"))
-        if mode_name == "expand_frontier":
-            blend_ratio = 0.18 + 0.28 * intensity
+
+        heuristic_prob = np.zeros_like(prob, dtype=np.float32)
+        valid_force_action = None
+        if force_action is not None:
+            force_action = int(force_action)
+            if 0 <= force_action < len(legal_action) and legal_action[force_action] > 0:
+                valid_force_action = force_action
+                heuristic_prob[force_action] += 0.70 if mode_name == "post_charge_release" else 1.0
+
+        if target_action is not None:
+            target_action = int(target_action)
+            if 0 <= target_action < len(legal_action) and legal_action[target_action] > 0:
+                target_weight = 1.0
+                if (
+                    valid_force_action is not None
+                    and mode_name == "post_charge_release"
+                    and target_action != valid_force_action
+                ):
+                    target_weight = 0.45
+                heuristic_prob[target_action] += target_weight
+
+        if not np.any(heuristic_prob > 0.0):
+            return prob
+
+        heuristic_prob = self._normalize_prob(heuristic_prob, legal_action, prob)
+        if mode_name == "post_charge_release":
+            blend_ratio = 0.22 + 0.16 * intensity
             if hold_active:
-                blend_ratio += 0.10
+                blend_ratio += 0.08
             if post_charge_expand:
-                blend_ratio += 0.14
-            blend_ratio = min(blend_ratio, 0.78)
+                blend_ratio += 0.06
+            blend_ratio = min(blend_ratio, 0.52)
+        elif mode_name == "expand_frontier":
+            blend_ratio = 0.10 + 0.16 * intensity
+            if hold_active:
+                blend_ratio += 0.06
+            if post_charge_expand:
+                blend_ratio += 0.08
+            blend_ratio = min(blend_ratio, 0.45)
         elif mode_name == "recenter":
-            blend_ratio = 0.10 + 0.18 * intensity
+            blend_ratio = 0.06 + 0.10 * intensity
         else:
-            blend_ratio = 0.12 + 0.23 * intensity
+            blend_ratio = 0.08 + 0.12 * intensity
         blended_prob = (1.0 - blend_ratio) * prob + blend_ratio * heuristic_prob
         return self._normalize_prob(blended_prob, legal_action, prob)
 
@@ -262,119 +289,148 @@ class Agent(BaseAgent):
                 and legal_action[int(action)] > 0
             )
 
-        def _collect_ranked_actions():
-            ranked_actions = []
-            for action in guidance.get("control_actions") or []:
-                if not _is_valid_action(action):
-                    continue
-                action = int(action)
-                if action not in ranked_actions:
-                    ranked_actions.append(action)
-
-            if _is_valid_action(target_action):
-                action = int(target_action)
-                if action in ranked_actions:
-                    ranked_actions.remove(action)
-                if path_found:
-                    ranked_actions.insert(0, action)
-                else:
-                    ranked_actions.append(action)
-
-            return ranked_actions
-
         target_action = guidance.get("target_action")
         force_action = guidance.get("force_action")
         controller_mode = guidance.get("controller_mode", "")
         path_found = bool(guidance.get("path_found"))
         dock_mode = bool(guidance.get("dock_mode"))
         first_charge_phase = bool(guidance.get("first_charge_phase"))
+        first_charge_stage = guidance.get("first_charge_stage", "")
+        target_dist = guidance.get("target_dist")
         stall_steps = int(guidance.get("charge_stall_steps", 0))
         urgency = float(np.clip(guidance.get("urgency", 0.0), 0.0, 1.0))
         route_reliable = bool(guidance.get("route_reliable"))
-        ranked_actions = _collect_ranked_actions()
+
+        ranked_actions = []
+        for action in guidance.get("control_actions") or []:
+            if not _is_valid_action(action):
+                continue
+            action = int(action)
+            if action not in ranked_actions:
+                ranked_actions.append(action)
+
+        preferred_action = None
+        if _is_valid_action(force_action):
+            preferred_action = int(force_action)
+        elif _is_valid_action(target_action):
+            preferred_action = int(target_action)
+
+        if preferred_action is not None:
+            if preferred_action in ranked_actions:
+                ranked_actions.remove(preferred_action)
+            if path_found or controller_mode in ("near_dock", "final_dock"):
+                # If a charger-directed action is already known, keep it at the front
+                # once the controller has entered the docking corridor.
+                ranked_actions.insert(0, preferred_action)
+            else:
+                ranked_actions.append(preferred_action)
+
         if not ranked_actions:
             fallback_prob = self._normalize_prob(np.asarray(base_prob, dtype=np.float32), legal_action, legal_action)
-            fallback_action = self._legal_sample(fallback_prob, use_max=True)
-            if first_charge_phase and (controller_mode in ("first_charge_dock", "first_charge_commit") or stall_steps >= 4):
-                rule_prob = np.zeros_like(base_prob, dtype=np.float32)
-                rule_prob[fallback_action] = 1.0
-                return {
-                    "prob": rule_prob,
-                    "force_action": int(fallback_action),
-                }
+            deterministic_action = None
+            # Once the robot is already inside the charger area, use a wider hard-commit
+            # window so the docking action is not diluted by policy exploration.
+            commit_dist = 3 if first_charge_phase else 2
+            near_commit_dist = 5 if first_charge_phase else 3
+            if (
+                preferred_action is not None
+                and controller_mode == "final_dock"
+                and target_dist is not None
+                and int(target_dist) <= commit_dist
+            ):
+                deterministic_action = preferred_action
+            elif (
+                preferred_action is not None
+                and controller_mode == "near_dock"
+                and target_dist is not None
+                and int(target_dist) <= near_commit_dist
+                and (first_charge_phase or stall_steps >= 2 or (not route_reliable))
+            ):
+                deterministic_action = preferred_action
             return {
                 "prob": fallback_prob,
-                "force_action": None,
-            }
-
-        if not _is_valid_action(force_action):
-            force_action = None
-        if force_action is not None:
-            rule_prob = np.zeros_like(base_prob, dtype=np.float32)
-            rule_prob[int(force_action)] = 1.0
-            return {
-                "prob": rule_prob,
-                "force_action": int(force_action),
-            }
-
-        if first_charge_phase and ranked_actions and (
-            controller_mode in ("first_charge_dock", "first_charge_commit") or stall_steps >= 4
-        ):
-            if controller_mode == "first_charge_commit" and _is_valid_action(target_action):
-                chosen_action = int(target_action)
-            else:
-                chosen_action = int(ranked_actions[0])
-            rule_prob = np.zeros_like(base_prob, dtype=np.float32)
-            rule_prob[chosen_action] = 1.0
-            return {
-                "prob": rule_prob,
-                "force_action": chosen_action,
+                "deterministic_action": deterministic_action,
             }
 
         mask = np.zeros_like(base_prob, dtype=np.float32)
         score_arr = np.zeros_like(base_prob, dtype=np.float32)
         decay = 1.0
-        decay_factor = 0.58 if dock_mode else 0.68
-        min_score = 0.18 if dock_mode else 0.10
+        if controller_mode == "final_dock":
+            decay_factor = 0.52
+            min_score = 0.26
+        elif controller_mode == "near_dock" or dock_mode:
+            decay_factor = 0.58
+            min_score = 0.18
+        elif controller_mode == "return_recovery":
+            decay_factor = 0.74
+            min_score = 0.08
+        else:
+            decay_factor = 0.68
+            min_score = 0.10
+
         for action in ranked_actions:
             mask[action] = 1.0
             score_arr[action] = decay
             decay = max(decay * decay_factor, min_score)
 
+        # Restrict the policy to charger-related candidates first, then blend it with
+        # a hand-ranked docking prior.
         heuristic_prob = self._normalize_prob(score_arr, legal_action, mask)
         base_focus_prob = self._normalize_prob(np.asarray(base_prob, dtype=np.float32) * mask, legal_action, heuristic_prob)
 
-        blend_ratio = 0.56 + 0.18 * urgency
-        if dock_mode:
-            blend_ratio += 0.10
+        blend_ratio = 0.52 + 0.14 * urgency
         if path_found:
             blend_ratio += 0.06
         if stall_steps >= 2:
-            blend_ratio += 0.08
-        if controller_mode == "dock":
-            blend_ratio = max(blend_ratio, 0.72)
-        elif controller_mode == "return_close":
-            blend_ratio = max(blend_ratio, 0.78)
-        elif controller_mode == "first_charge_dock":
-            blend_ratio = max(blend_ratio, 0.92)
-        elif controller_mode == "first_charge_close":
-            blend_ratio = max(blend_ratio, 0.80)
-        elif controller_mode == "first_charge_commit":
-            blend_ratio = max(blend_ratio, 0.88 if route_reliable else 0.82)
-        elif controller_mode == "first_charge_return":
-            blend_ratio = max(blend_ratio, 0.72 if route_reliable else 0.68)
-        elif controller_mode == "return":
-            blend_ratio = max(blend_ratio, 0.62)
-        elif controller_mode == "first_charge_mix":
-            blend_ratio = max(blend_ratio, 0.66 if route_reliable else 0.60)
-        blend_ratio = float(np.clip(blend_ratio, 0.56, 0.92))
+            blend_ratio += 0.04
+
+        # Near the dock, let rule control dominate so the model does not waste the
+        # remaining battery on small detours or oscillations.
+        if controller_mode == "final_dock":
+            blend_ratio = max(blend_ratio, 0.92 if route_reliable else 0.88)
+        elif controller_mode == "near_dock":
+            near_dock_floor = 0.82 if route_reliable else 0.78
+            if first_charge_phase:
+                near_dock_floor += 0.10
+            if stall_steps >= 2:
+                near_dock_floor += 0.06
+            blend_ratio = max(blend_ratio, near_dock_floor)
+        elif controller_mode == "return_recovery":
+            blend_ratio = max(blend_ratio, 0.60 if route_reliable else 0.54)
+        elif first_charge_phase:
+            if first_charge_stage == "dock":
+                blend_ratio = max(blend_ratio, 0.80 if route_reliable else 0.76)
+            else:
+                blend_ratio = max(blend_ratio, 0.72 if route_reliable else 0.68)
+        else:
+            blend_ratio = max(blend_ratio, 0.58 if route_reliable else 0.54)
+        blend_ratio = float(np.clip(blend_ratio, 0.50, 0.94))
 
         rule_prob = (1.0 - blend_ratio) * base_focus_prob + blend_ratio * heuristic_prob
         rule_prob = self._normalize_prob(rule_prob, legal_action, heuristic_prob)
 
+        deterministic_action = None
+        commit_dist = 3 if first_charge_phase else 2
+        near_commit_dist = 5 if first_charge_phase else 3
+        if (
+            preferred_action is not None
+            and controller_mode == "final_dock"
+            and target_dist is not None
+            and int(target_dist) <= commit_dist
+        ):
+            deterministic_action = preferred_action
+        elif (
+            preferred_action is not None
+            and controller_mode == "near_dock"
+            and target_dist is not None
+            and int(target_dist) <= near_commit_dist
+            and (first_charge_phase or stall_steps >= 2 or (not route_reliable))
+        ):
+            deterministic_action = preferred_action
+
         return {
             "prob": rule_prob,
-            "force_action": force_action,
+            "deterministic_action": deterministic_action,
         }
 
     def _legal_sample(self, probs, use_max=False):

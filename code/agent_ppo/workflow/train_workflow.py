@@ -55,7 +55,7 @@ def _extract_extra_info(env_obs):
     return env_obs.get("extra_info") or observation.get("extra_info") or {}
 
 
-def _extract_result_details(env_obs, fm, truncated):
+def _extract_result_details(env_obs, fm, truncated, step):
     env_info = env_obs.get("observation", {}).get("env_info", {})
     extra_info = _extract_extra_info(env_obs)
     snapshot = fm.get_debug_snapshot()
@@ -66,9 +66,19 @@ def _extract_result_details(env_obs, fm, truncated):
     clean_score = int(env_info.get("clean_score", total_score))
     remaining_charge = int(env_info.get("remaining_charge", snapshot["remaining_charge"]))
     charge_count = int(env_info.get("charge_count", snapshot["charge_count"]))
+    max_step = max(int(env_info.get("max_step", fm.max_step)), 1)
+    frame_no = int(env_obs.get("frame_no", step))
+    completed_by_max_step = bool(
+        truncated
+        and result_code in (None, 0)
+        and not result_message
+        and max(step, frame_no) >= max_step
+    )
 
-    if truncated:
-        fail_reason = "max_step_or_truncated"
+    if completed_by_max_step:
+        fail_reason = "completed_max_step"
+    elif truncated:
+        fail_reason = "abnormal_truncated"
     elif result_message:
         fail_reason = str(result_message)
     elif result_code not in (None, 0):
@@ -88,6 +98,9 @@ def _extract_result_details(env_obs, fm, truncated):
         "clean_score": clean_score,
         "remaining_charge": remaining_charge,
         "charge_count": charge_count,
+        "frame_no": frame_no,
+        "max_step": max_step,
+        "is_completed": completed_by_max_step,
         "snapshot": snapshot,
     }
 
@@ -161,8 +174,8 @@ class EpisodeRunner:
                 final_reward = 0.0
                 if done:
                     fm = self.agent.preprocessor
-                    result_details = _extract_result_details(env_obs, fm, truncated)
-                    if truncated:
+                    result_details = _extract_result_details(env_obs, fm, truncated, step)
+                    if result_details["is_completed"]:
                         cleaning_ratio = fm.dirt_cleaned / max(fm.total_dirt, 1)
                         final_reward = 5.0 + 5.0 * cleaning_ratio
                         result_str = "WIN"
@@ -188,9 +201,7 @@ class EpisodeRunner:
                                     final_reward -= 0.25
                                 elif snapshot["first_charge_stage"] == "return":
                                     final_reward -= 0.15
-                            if snapshot["charge_recovery_mode"] == "dock":
-                                final_reward -= 0.15
-                            elif snapshot["charge_recovery_mode"] == "reroute":
+                            if snapshot["charge_recovery_mode"] == "reroute":
                                 final_reward -= 0.08
                             if snapshot["charge_stall_steps"] >= 4:
                                 final_reward -= 0.10
@@ -220,7 +231,6 @@ class EpisodeRunner:
                         f"charge_return_state:{snapshot['charge_return_mode']} "
                         f"charge_recovery:{snapshot['charge_recovery_mode']} "
                         f"charge_controller:{snapshot['charge_controller_mode']} "
-                        f"charge_force:{snapshot['charge_force_action']} "
                         f"charge_allowed:{snapshot['charge_allowed_count']} "
                         f"soft_radius:{snapshot['soft_clean_radius']} "
                         f"hard_radius:{snapshot['hard_clean_radius']} "
