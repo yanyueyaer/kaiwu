@@ -15,6 +15,7 @@ import numpy as np
 
 
 def _norm(v, v_max, v_min=0.0):
+    """将数值裁剪到给定范围后归一化到 `[0, 1]`。"""
     v = float(np.clip(v, v_min, v_max))
     if v_max == v_min:
         return 0.0
@@ -22,11 +23,13 @@ def _norm(v, v_max, v_min=0.0):
 
 
 def _signed_norm(v, scale):
+    """将带符号的位移按尺度压缩到 `[-1, 1]`，保留方向信息。"""
     scale = max(float(scale), 1.0)
     return float(np.clip(float(v) / scale, -1.0, 1.0))
 
 
 def _as_list(value):
+    """把 `None`、单值或元组统一包装成列表，便于后续按列表遍历。"""
     if value is None:
         return []
     if isinstance(value, (list, tuple)):
@@ -35,11 +38,13 @@ def _as_list(value):
 
 
 def _first_or_default(value):
+    """从可能为单个对象或列表的字段中取第一个元素，取不到返回空字典。"""
     items = _as_list(value)
     return items[0] if items else {}
 
 
 def _as_point(value):
+    """把带 `x/z` 键的字典解析成整数网格坐标 `(x, z)`。"""
     if not isinstance(value, dict):
         return None
     x = value.get("x")
@@ -50,6 +55,15 @@ def _as_point(value):
 
 
 class Preprocessor:
+    """
+    负责把原始环境观测整理成特征、奖励和引导辅助状态。
+
+    这个类是当前项目里与“充电逻辑”关系最重的模块，主要承担四件事：
+    1. 解析环境观测，维护地图记忆、访问统计、电量和实体位置等状态。
+    2. 构建回充引导、探索引导和 NPC 规避引导，形成可观测的中间决策信息。
+    3. 生成策略网络输入特征，把回充相关状态显式编码进 observation。
+    4. 计算 shaped reward，把“什么时候该回充、是否成功充上”变成训练信号。
+    """
     GRID_SIZE = 128
     VIEW_SIZE = 21
     VIEW_HALF = VIEW_SIZE // 2
@@ -70,9 +84,17 @@ class Preprocessor:
     DELTA_TO_ACTION = {delta: idx for idx, delta in enumerate(ACTION_DELTAS)}
 
     def __init__(self):
+        """初始化预处理器，并建立一套全新的局内状态。"""
         self.reset()
 
     def reset(self):
+        """
+        重置整局运行时状态。
+
+        这里会清空地图记忆、访问统计、回充/探索/NPC 引导缓存，以及与
+        首次充电策略、充电桩锁定、路径缓存相关的所有中间状态，确保每局
+        从一致的初始条件开始。
+        """
         self.step_no = 0
         self.max_step = 2000
 
@@ -122,6 +144,20 @@ class Preprocessor:
         self.charge_cycle_explore_start = 0
         self.charge_cycle_clean_start = 0
         self.charge_cycle_start_step = 0
+        self.first_charge_step = None
+        self.return_trigger_step = None
+        self.return_trigger_margin = None
+        self.first_return_trigger_step = None
+        self.min_battery_margin = None
+        self.battery_margin_at_first_charge = None
+        self.low_battery_steps = 0
+        self.low_battery_route_progress_sum = 0.0
+        self.low_battery_route_progress_count = 0
+        self.dock_contact_without_charge = 0
+        self.route_stall_steps_total = 0
+        self.max_charge_stall_steps = 0
+        self.charge_route_found_steps = 0
+        self.charge_guidance_steps = 0
 
         self._view_map = np.zeros((self.VIEW_SIZE, self.VIEW_SIZE), dtype=np.float32)
         self._legal_act = [1] * 8
@@ -143,6 +179,7 @@ class Preprocessor:
         self._charge_route_commit_until_step = -1
 
     def _empty_charge_guidance(self):
+        """构造默认的回充引导字典，作为回桩语义状态的统一输出格式。"""
         return {
             "should_return": False,
             "reason": "",
@@ -158,11 +195,6 @@ class Preprocessor:
             "hard_radius": 0,
             "dock_mode": False,
             "dock_radius": 0,
-            "return_mode": "",
-            "recovery_mode": "",
-            "controller_mode": "",
-            "force_action": None,
-            "control_actions": [],
             "route_source": "",
             "route_reliable": False,
             "first_charge_phase": False,
@@ -171,11 +203,11 @@ class Preprocessor:
             "first_charge_budget_margin": None,
             "first_charge_step_limit": 0,
             "first_charge_out_radius": 0,
-            "charge_rule_control": False,
             "charge_stall_steps": 0,
         }
 
     def _empty_explore_guidance(self):
+        """构造默认的探索引导字典，未启用探索控制时返回该结构。"""
         return {
             "active": False,
             "should_pull_back": False,
@@ -199,6 +231,7 @@ class Preprocessor:
         }
 
     def _empty_npc_guidance(self):
+        """构造默认的 NPC 规避引导字典。"""
         return {
             "should_evade": False,
             "reason": "",
@@ -210,6 +243,7 @@ class Preprocessor:
         }
 
     def _empty_strategy_state(self):
+        """构造默认的高层策略状态，供全局特征和调试日志使用。"""
         return {
             "mode_name": "clean",
             "mode_intensity": 0.0,
@@ -220,18 +254,21 @@ class Preprocessor:
         }
 
     def _activate_expand_hold(self, hold_steps):
+        """延长探索目标保持期，避免探索目标在短时间内频繁抖动。"""
         hold_steps = max(int(hold_steps), 0)
         if hold_steps <= 0:
             return
         self.expand_hold_until_step = max(self.expand_hold_until_step, self.step_no + hold_steps - 1)
 
     def _activate_post_charge_expand(self, hold_steps):
+        """激活充电后的外扩探索窗口。"""
         hold_steps = max(int(hold_steps), 0)
         if hold_steps <= 0:
             return
         self.post_charge_expand_until_step = max(self.post_charge_expand_until_step, self.step_no + hold_steps - 1)
 
     def _activate_post_charge_release(self, hold_steps):
+        """激活充电后短暂离桩阶段，先把机器人从充电桩附近拉开。"""
         hold_steps = max(int(hold_steps), 0)
         if hold_steps <= 0:
             return
@@ -241,9 +278,11 @@ class Preprocessor:
         )
 
     def _clear_post_charge_release(self):
+        """清除充电后离桩阶段。"""
         self.post_charge_release_until_step = -1
 
     def _lock_charge_target(self, target_pos, hold_steps):
+        """短暂锁定当前充电桩目标，避免低电量时在多个桩之间来回切换。"""
         if target_pos is None:
             return
         self._charge_target_lock_pos = tuple(target_pos)
@@ -255,10 +294,12 @@ class Preprocessor:
             )
 
     def _clear_charge_target_lock(self):
+        """清除充电桩目标锁定状态。"""
         self._charge_target_lock_pos = None
         self._charge_target_lock_until_step = -1
 
     def _get_charge_target_lock(self):
+        """读取仍然有效的充电桩锁定目标；过期或失效时自动清除。"""
         if self._charge_target_lock_pos is None:
             return None
         if self.step_no > self._charge_target_lock_until_step:
@@ -270,6 +311,7 @@ class Preprocessor:
         return self._charge_target_lock_pos
 
     def _commit_charge_route(self, target_pos, hold_steps):
+        """提交当前回桩路径，在短窗口内优先沿既定路径推进。"""
         if target_pos is None:
             return
         self._charge_route_commit_target_pos = tuple(target_pos)
@@ -281,10 +323,12 @@ class Preprocessor:
             )
 
     def _clear_charge_route_commit(self):
+        """清除已提交的回桩路径承诺。"""
         self._charge_route_commit_target_pos = None
         self._charge_route_commit_until_step = -1
 
     def _is_charge_route_committed(self, target_pos):
+        """判断某个充电桩目标是否仍处于路径承诺窗口内。"""
         if target_pos is None or self._charge_route_commit_target_pos is None:
             return False
         if tuple(target_pos) != self._charge_route_commit_target_pos:
@@ -295,18 +339,31 @@ class Preprocessor:
         return True
 
     def _has_expand_hold(self):
+        """判断当前是否仍在探索目标保持期内。"""
         return bool(self.step_no <= self.expand_hold_until_step)
 
     def _has_post_charge_expand(self):
+        """判断当前是否仍在充电后的外扩探索阶段。"""
         return bool(self.step_no <= self.post_charge_expand_until_step)
 
     def _has_post_charge_release(self):
+        """判断当前是否仍在充电后的离桩阶段。"""
         return bool(self.step_no <= self.post_charge_release_until_step)
 
     def _in_first_charge_phase(self):
+        """
+        判断当前是否仍处于“首次成功充电之前”的保守阶段。
+
+        这是整套回充规则最关键的分叉条件之一。首次充电前，策略会更早触发
+        回桩，也会更保守地评估电量预算。
+        """
+        # 只要本局还没有完成第一次成功充电，就一直视为“首次充电阶段”。
+        # 整个控制器最保守的一套回桩策略，都是围绕这个条件展开的：
+        # 宁可早一点回去，也不要把第一次充电机会耗死在路上或桩边。
         return bool(self.charge_count <= 0)
 
     def _is_reverse_action(self, action):
+        """判断动作是否与上一步方向完全相反。"""
         if not (0 <= int(action) < len(self.ACTION_DELTAS)):
             return False
         if not (0 <= int(self.last_action) < len(self.OPPOSITE_ACTIONS)):
@@ -314,6 +371,7 @@ class Preprocessor:
         return int(action) == int(self.OPPOSITE_ACTIONS[int(self.last_action)])
 
     def _is_ping_pong_action(self, action):
+        """判断动作是否形成前后两步来回摆动的“乒乓”模式。"""
         if not (0 <= int(action) < len(self.ACTION_DELTAS)):
             return False
         if not (0 <= int(self.prev_action) < len(self.OPPOSITE_ACTIONS)):
@@ -326,10 +384,12 @@ class Preprocessor:
         )
 
     def _clear_expand_focus(self):
+        """清除当前保持中的探索焦点目标。"""
         self._expand_focus_target = None
         self._expand_focus_reason = ""
 
     def _did_charge_this_step(self, target_dist=None):
+        """根据充电次数和电量跃升判断本步是否刚刚成功充电。"""
         if self.charge_count > self.prev_charge_count:
             return True
         if target_dist is None or int(target_dist) > 1:
@@ -342,6 +402,7 @@ class Preprocessor:
         )
 
     def _handle_charge_success(self):
+        """处理一次成功充电后的状态收尾，并启动充电后的扩张序列。"""
         self.prev_charge_cycle_explore_gain = max(0, self.explored_cells - self.charge_cycle_explore_start)
         self.prev_charge_cycle_clean_gain = max(0, self.dirt_cleaned - self.charge_cycle_clean_start)
         self.prev_charge_cycle_step_span = max(1, self.step_no - self.charge_cycle_start_step)
@@ -356,6 +417,12 @@ class Preprocessor:
         self._last_charge_target_pos = None
 
     def _apply_post_charge_sequence(self):
+        """
+        根据上一个充电周期收益，配置充电后的离桩与外扩探索窗口。
+
+        如果上一个周期探索和清扫收益都偏低，会明显缩短扩张窗口，避免在低效
+        循环里反复做相同的离桩动作。
+        """
         inefficient_cycle = bool(
             self.charge_count >= 4
             and self.prev_charge_cycle_explore_gain <= 10
@@ -378,10 +445,22 @@ class Preprocessor:
         self._clear_expand_focus()
 
     def pb2struct(self, env_obs, last_action):
+        """
+        解析环境观测并刷新预处理器内部快照。
+
+        这是预处理器的主入口。函数会顺序完成原始观测解包、位置/电量/地图
+        同步、记忆地图更新、访问统计、回充引导、探索引导、NPC 规避引导和
+        高层策略状态构建。后续特征提取、奖励计算和日志统计，都以
+        这里维护出的状态为依据。
+
+        可以把它理解成“单帧状态机推进器”：
+        每来一帧观测，这里就把当前局面重新投影成一套可训练、可调试、可追踪的内部状态。
+        """
         observation = env_obs.get("observation", env_obs)
         frame_state = observation.get("frame_state") or {}
         env_info = observation.get("env_info") or {}
 
+        # 先解析机器人当前位置和基础局内计数，这是后续所有距离、预算和奖励计算的基准。
         hero = _first_or_default(frame_state.get("heroes"))
         hero_pos = _as_point(hero.get("pos", {}))
         if hero_pos is None:
@@ -420,6 +499,7 @@ class Preprocessor:
             legal_action = env_obs.get("legal_act")
         self._legal_act = [int(x) for x in (legal_action or [1] * 8)]
 
+        # 收集动态实体和充电桩位置，供路径规划、风险评估和回充预算使用。
         self._npc_positions = []
         for npc in _as_list(frame_state.get("npcs")):
             pos = _as_point((npc or {}).get("pos", {}))
@@ -445,6 +525,7 @@ class Preprocessor:
             self._view_map = np.array(map_info, dtype=np.float32)
             self._update_memory()
 
+        # 在地图和计数都同步后，再推进回充/探索/NPC 三套引导状态机。
         self._mark_visit()
         self._update_cleaned_memory(env_info.get("step_cleaned_cells") or [])
         self.explored_cells = int(self.explored_map.sum())
@@ -458,6 +539,7 @@ class Preprocessor:
             200.0 if self._charge_guidance["target_dist"] is None else float(self._charge_guidance["target_dist"])
         )
         self._update_charge_progress_state()
+        self._update_charge_training_stats()
         self._explore_guidance = self._build_explore_guidance()
         self.explore_route_dist = (
             200.0 if self._explore_guidance["target_dist"] is None else float(self._explore_guidance["target_dist"])
@@ -466,11 +548,18 @@ class Preprocessor:
         self._strategy_state = self._build_strategy_state()
 
     def _update_charge_progress_state(self):
+        """
+        根据本步与上一步的回桩距离变化，维护“回桩是否卡住”的状态。
+
+        这个状态会影响是否清理路径缓存、是否允许 reroute，以及 near-dock
+        阶段是否进一步提高回桩紧迫度和卡顿惩罚。
+        """
         guidance = self._charge_guidance
         target_pos = guidance.get("target_pos")
         target_dist = guidance.get("target_dist")
         should_return = bool(guidance.get("should_return"))
 
+        # 没在回桩时，卡顿计数没有意义，直接清零。
         if not should_return or target_pos is None or target_dist is None:
             self._charge_progress_stall_steps = 0
             self._last_charge_target_pos = target_pos
@@ -486,6 +575,7 @@ class Preprocessor:
         if self.last_charger_route_dist < 200.0:
             progress = float(self.last_charger_route_dist) - float(target_dist)
 
+        # 用“本步目标距离相对上一步有没有下降”来近似判断回桩是否推进。
         if progress is None or not same_target:
             self._charge_progress_stall_steps = 0
         elif progress >= 1.0:
@@ -512,7 +602,75 @@ class Preprocessor:
 
         self._last_charge_target_pos = target_pos
 
+    def _update_charge_training_stats(self):
+        """
+        更新与回桩充电学习直接相关的统计量。
+
+        这些统计不会参与动作硬控，只用于奖励调试和训练日志。
+        核心关注点是：
+        1. 机器人是否在足够早的时候开始回桩。
+        2. 低电量回桩时是否真的在持续逼近充电桩。
+        3. 是否出现贴桩不充、电量预算过低或长时间卡住的问题。
+        """
+        guidance = self._charge_guidance
+        battery_margin = guidance.get("battery_margin")
+        target_dist = guidance.get("target_dist")
+        should_return = bool(guidance.get("should_return"))
+        first_charge_phase = bool(guidance.get("first_charge_phase"))
+        charged_this_step = bool(self._did_charge_this_step(target_dist))
+
+        if battery_margin is not None:
+            battery_margin = int(battery_margin)
+            if self.min_battery_margin is None:
+                self.min_battery_margin = battery_margin
+            else:
+                self.min_battery_margin = min(self.min_battery_margin, battery_margin)
+
+        if should_return:
+            self.charge_guidance_steps += 1
+            if guidance.get("path_found", False):
+                self.charge_route_found_steps += 1
+
+            if self.return_trigger_step is None:
+                self.return_trigger_step = int(self.step_no)
+                self.return_trigger_margin = battery_margin
+            if first_charge_phase and self.first_return_trigger_step is None:
+                self.first_return_trigger_step = int(self.step_no)
+
+        route_progress = None
+        if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
+            route_progress = float(self.last_charger_route_dist - self.charger_route_dist)
+
+        activation_buffer = int(guidance.get("activation_buffer", 0))
+        low_battery_threshold = max(8, activation_buffer // 2)
+        if battery_margin is not None and battery_margin <= low_battery_threshold:
+            self.low_battery_steps += 1
+            if route_progress is not None:
+                self.low_battery_route_progress_sum += float(route_progress)
+                self.low_battery_route_progress_count += 1
+
+        if should_return:
+            stall_steps = int(guidance.get("charge_stall_steps", 0))
+            if stall_steps > 0:
+                self.route_stall_steps_total += 1
+                self.max_charge_stall_steps = max(self.max_charge_stall_steps, stall_steps)
+
+        if (
+            guidance.get("dock_mode", False)
+            and target_dist is not None
+            and int(target_dist) <= 1
+            and not charged_this_step
+        ):
+            self.dock_contact_without_charge += 1
+
+        if charged_this_step:
+            if self.first_charge_step is None:
+                self.first_charge_step = int(self.step_no)
+            if self.battery_margin_at_first_charge is None:
+                self.battery_margin_at_first_charge = battery_margin
+
     def _update_memory(self):
+        """把当前局部视野写入全局记忆地图，并标记对应区域已探索。"""
         hx, hz = self.cur_pos
         for row in range(self.VIEW_SIZE):
             for col in range(self.VIEW_SIZE):
@@ -524,11 +682,13 @@ class Preprocessor:
                     self.memory_map[gx, gz] = cell
 
     def _mark_visit(self):
+        """累计当前位置访问次数，为去重访问惩罚和路径评分提供依据。"""
         hx, hz = self.cur_pos
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             self.visit_count[hx, hz] = min(self.visit_count[hx, hz] + 1, 32767)
 
     def _update_cleaned_memory(self, cleaned_cells):
+        """根据本步清扫到的格子，修正记忆地图中的脏污状态。"""
         for cell in cleaned_cells:
             point = _as_point(cell)
             if point is None:
@@ -539,9 +699,11 @@ class Preprocessor:
                 self.memory_map[x, z] = 1
 
     def _get_local_view_feature(self):
+        """提取局部视野特征，并压平为模型输入向量。"""
         return (self._view_map / 2.0).astype(np.float32).flatten()
 
     def _nearest_point(self, positions):
+        """在若干目标点中找到离当前位置最近的一个，并返回切比雪夫距离。"""
         if not positions:
             return None, None
 
@@ -556,6 +718,7 @@ class Preprocessor:
         return best_point, best_dist
 
     def _calc_nearest_dirt_dist(self):
+        """计算局部视野内最近脏污格到视野中心的距离。"""
         dirt_coords = np.argwhere(self._view_map == 2)
         if len(dirt_coords) == 0:
             return 200.0
@@ -564,12 +727,14 @@ class Preprocessor:
         return float(np.min(dists))
 
     def _get_visit_penalty(self, pos):
+        """读取某个位置的访问惩罚值，并限制在最大计数上限内。"""
         x, z = pos
         if 0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE:
             return min(int(self.visit_count[x, z]), self.MAX_VISIT_COUNT)
         return self.MAX_VISIT_COUNT
 
     def _npc_risk_at(self, pos):
+        """评估某个位置附近的 NPC 风险强度，并返回最近 NPC 距离。"""
         if not self._npc_positions:
             return 0.0, None
 
@@ -593,6 +758,7 @@ class Preprocessor:
         return 0.0, nearest_dist
 
     def _is_blocked(self, pos, allow_unknown=True):
+        """判断某个格子是否不可通过；可按需把未知区域视为可通行。"""
         x, z = pos
         if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
             return True
@@ -604,9 +770,11 @@ class Preprocessor:
         return cell == self.BLOCKED_CELL
 
     def _chebyshev_dist(self, start_pos, target_pos):
+        """计算两个网格点的切比雪夫距离。"""
         return max(abs(target_pos[0] - start_pos[0]), abs(target_pos[1] - start_pos[1]))
 
     def _route_step_penalty(self, pos):
+        """给路径上的候选格子附加额外代价，惩罚未知区、重复访问和 NPC 风险。"""
         x, z = pos
         cost = 0.0
 
@@ -622,17 +790,25 @@ class Preprocessor:
         return cost
 
     def _get_route_cache(self, cache_name):
+        """读取指定用途的路径缓存。"""
         if cache_name == "explore":
             return self._explore_route_cache
         return self._charge_route_cache
 
     def _set_route_cache(self, cache_name, cache):
+        """写入指定用途的路径缓存。"""
         if cache_name == "explore":
             self._explore_route_cache = cache
         else:
             self._charge_route_cache = cache
 
     def _trim_cached_route(self, target_pos, cache_name="charge", allow_unknown=True):
+        """
+        尝试复用历史路径缓存，并裁剪出从当前位置继续可走的剩余路径。
+
+        如果缓存目标、未知区设置或下一步动作已经失效，就直接放弃缓存，
+        由上层重新规划。
+        """
         cache = self._get_route_cache(cache_name)
         if not cache or cache.get("target_pos") != target_pos:
             return None
@@ -676,6 +852,16 @@ class Preprocessor:
         return route
 
     def _plan_path_to_target(self, target_pos, allow_unknown=True):
+        """
+        在记忆地图上规划一条到目标点的低代价路径。
+
+        这里使用带启发式的网格搜索，在基础步长成本之外，还会叠加未知区域、
+        高访问次数和 NPC 风险惩罚。它是回充路径和探索路径共享的底层规划器，
+        规划质量会直接影响后续回桩奖励和训练指标是否稳定。
+
+        返回结果不是整套控制决策，而是一条“从当前位置到目标点”的候选路径。
+        上层会再基于路径质量、电量预算和当前阶段，决定要不要真的进入回桩。
+        """
         if target_pos is None:
             return None
 
@@ -690,6 +876,7 @@ class Preprocessor:
                 "path_found": True,
             }
 
+        # 只在起点和终点附近开一个局部搜索框，避免每帧都在整张地图上暴力搜索。
         base_dist = self._chebyshev_dist(start_pos, target_pos)
         if base_dist <= 18:
             margin = 12
@@ -703,6 +890,7 @@ class Preprocessor:
         min_z = max(0, min(start_pos[1], target_pos[1]) - margin)
         max_z = min(self.GRID_SIZE - 1, max(start_pos[1], target_pos[1]) + margin)
 
+        # A* 风格搜索：优先队列里存的是 f = g + h。
         frontier = [(float(base_dist), 0, 0.0, start_pos)]
         best_cost = {start_pos: 0.0}
         parents = {start_pos: (None, None)}
@@ -728,6 +916,7 @@ class Preprocessor:
                 if self._is_blocked(next_pos, allow_unknown=allow_unknown):
                     continue
 
+                # 走对角线时，若两条侧边都被堵死，就不允许“斜穿墙角”。
                 if dx != 0 and dz != 0:
                     side_pos_1 = (cx + dx, cz)
                     side_pos_2 = (cx, cz + dz)
@@ -736,6 +925,7 @@ class Preprocessor:
                     ):
                         continue
 
+                # g 代价除了基础步长，还会叠加未知区、重复访问和 NPC 风险惩罚。
                 next_cost = cur_cost + 1.0 + self._route_step_penalty(next_pos)
                 prev_cost = best_cost.get(next_pos)
                 if prev_cost is not None and next_cost >= prev_cost - 1e-9:
@@ -773,6 +963,7 @@ class Preprocessor:
         }
 
     def _get_route_to_target(self, target_pos, cache_name="charge", allow_unknown=True):
+        """优先复用缓存路径；缓存不可用时重新规划到目标点的路线。"""
         cached_route = self._trim_cached_route(target_pos, cache_name=cache_name, allow_unknown=allow_unknown)
         if cached_route is not None:
             return cached_route
@@ -794,12 +985,23 @@ class Preprocessor:
         return route
 
     def _get_best_route_to_charger(self, allow_unknown=True, preferred_target=None):
+        """
+        在所有充电桩中选择当前最合适的回桩路线。
+
+        该函数会优先尊重锁定目标或缓存目标，然后在所有可达充电桩之间比较
+        路径步数与距离，选出最稳妥的回桩目标，并同步更新回桩路径缓存与
+        提交窗口。
+
+        这个函数只回答“如果现在要回桩，走哪一个桩更合适”，
+        不直接回答“现在是否应该回桩”。
+        """
         if not self._charger_positions:
             self._charge_route_cache = None
             self._clear_charge_route_commit()
             return None
 
         if preferred_target is not None:
+            # 锁定目标存在时优先尝试它，避免低电量阶段在多个桩之间摇摆。
             preferred_target = tuple(preferred_target)
             if preferred_target not in self._charger_positions:
                 return None
@@ -828,6 +1030,7 @@ class Preprocessor:
             self._commit_charge_route(preferred_route["target_pos"], hold_steps=6)
             return preferred_route
 
+        # 否则就在所有候选桩里选一条最短、最稳定的路线。
         best_route = None
         cache = self._get_route_cache("charge")
         if cache and cache.get("target_pos") in self._charger_positions:
@@ -878,6 +1081,7 @@ class Preprocessor:
         return best_route
 
     def _count_neighbor_cells(self, pos, radius, cell_value):
+        """统计某个位置邻域内指定类型格子的数量。"""
         x, z = pos
         count = 0
         for dx in range(-radius, radius + 1):
@@ -892,6 +1096,13 @@ class Preprocessor:
         return count
 
     def _select_explore_target(self, charger_pos, desired_radius, soft_radius, hard_radius, budget_limit=None):
+        """
+        在充电桩周围的安全环带内选择一个最值得探索的目标点。
+
+        候选点评分会综合 frontier 密度、附近脏污、访问惩罚、NPC 风险、
+        与期望半径的匹配程度以及当前到达成本。这样做的目标不是盲目走远，
+        而是在“还能安全回桩”的前提下，把探索收益尽量集中到高价值区域。
+        """
         if charger_pos is None:
             self._explore_route_cache = None
             return None
@@ -987,6 +1198,7 @@ class Preprocessor:
         return best_target
 
     def _get_expand_focus_candidate(self, charger_pos, desired_radius, hard_radius, budget_limit=None):
+        """尝试继续沿用上一轮已经选中的探索焦点，减少探索目标抖动。"""
         target_pos = self._expand_focus_target
         if target_pos is None or charger_pos is None:
             return None
@@ -1043,6 +1255,12 @@ class Preprocessor:
         }
 
     def _build_strategy_state(self):
+        """
+        把回充引导和探索引导压缩成一个高层模式状态。
+
+        这个状态一方面会编码进全局特征，另一方面也方便训练日志直接看到
+        当前大致处于 clean / expand / return / dock 哪个阶段。
+        """
         charge = self._charge_guidance
         explore = self._explore_guidance
 
@@ -1066,6 +1284,13 @@ class Preprocessor:
         return state
 
     def _get_cleaning_radius_limits(self):
+        """
+        根据电量、安全预留和回桩成本，动态计算软/硬清扫半径。
+
+        可以把它理解成“当前这点电量下，离充电桩多远还算安全”的粗粒度边界：
+        - `soft_radius` 用来提示探索应开始收敛。
+        - `hard_radius` 表示再往外通常就该回桩了。
+        """
         reserve = max(22, int(self.battery_max * 0.10))
         base_soft = max(18, int(self.battery_max * 0.13))
         base_hard = max(base_soft + 8, int(self.battery_max * 0.20))
@@ -1079,75 +1304,8 @@ class Preprocessor:
         hard_radius = int(np.clip(max(soft_radius + 6, hard_candidate), soft_radius + 6, 44))
         return soft_radius, hard_radius
 
-    def _rank_charge_actions(self, target_pos, target_action=None, dock_mode=False, strict_progress=False):
-        if target_pos is None:
-            return []
-
-        hx, hz = self.cur_pos
-        tx, tz = target_pos
-        current_dist = max(abs(tx - hx), abs(tz - hz))
-        current_l1 = abs(tx - hx) + abs(tz - hz)
-        ranked_actions = []
-
-        for action, (dx, dz) in enumerate(self.ACTION_DELTAS):
-            if action >= len(self._legal_act) or not self._legal_act[action]:
-                continue
-
-            nx = hx + dx
-            nz = hz + dz
-            next_pos = (nx, nz)
-            next_dist = max(abs(tx - nx), abs(tz - nz))
-            progress = current_dist - next_dist
-            next_l1 = abs(tx - nx) + abs(tz - nz)
-            l1_progress = current_l1 - next_l1
-            visit_penalty = self._get_visit_penalty(next_pos)
-            npc_risk, next_npc_dist = self._npc_risk_at(next_pos)
-            preferred_action = target_action is not None and action == int(target_action)
-
-            if next_npc_dist is not None and next_npc_dist <= 1:
-                continue
-            if dock_mode and not preferred_action:
-                if next_dist > current_dist:
-                    continue
-                if current_dist <= 3 and next_dist >= current_dist and next_pos != target_pos:
-                    continue
-                if current_dist <= 2 and next_l1 >= current_l1 and next_pos != target_pos:
-                    continue
-            if strict_progress and not preferred_action:
-                if progress < 0:
-                    continue
-                if progress == 0 and l1_progress <= 0 and next_pos != target_pos:
-                    continue
-
-            score = 0.0
-            score += (100.0 if dock_mode else 72.0) * progress
-            score += (14.0 if dock_mode else 8.0) * l1_progress
-            score -= (2.5 if dock_mode else 1.2) * next_dist
-            score -= (0.60 if dock_mode else 0.35) * visit_penalty
-            score -= (18.0 if dock_mode else 14.0) * npc_risk
-            if strict_progress and (not preferred_action) and progress <= 0 and next_pos != target_pos:
-                score -= 12.0 if dock_mode else 7.0
-
-            if next_pos == target_pos:
-                score += 80.0 if dock_mode else 30.0
-            elif dock_mode and next_dist <= 1:
-                score += 24.0
-
-            if target_action is not None and action == int(target_action):
-                score += 16.0 if dock_mode else 10.0
-            if self._is_reverse_action(action):
-                score -= 10.0 if (dock_mode or strict_progress) else 4.0
-            if self._is_ping_pong_action(action):
-                score -= 14.0 if (dock_mode or strict_progress) else 5.0
-            if action == self.last_action and progress >= 0:
-                score += 1.0
-
-            ranked_actions.append((score, progress, l1_progress, -next_dist, action))
-
-        ranked_actions.sort(reverse=True)
-        return [int(action) for _, _, _, _, action in ranked_actions]
-
     def _choose_action_towards(self, target_pos):
+        """在不显式规划整条路径时，贪心选择一个朝目标点推进的动作。"""
         if target_pos is None:
             return None
 
@@ -1187,6 +1345,7 @@ class Preprocessor:
         return best_action
 
     def _choose_action_away_from(self, target_pos):
+        """选择一个远离目标点的动作，常用于离桩或重新拉开安全距离。"""
         if target_pos is None:
             return None
 
@@ -1223,6 +1382,7 @@ class Preprocessor:
         return best_action
 
     def _is_valid_legal_action(self, action):
+        """判断动作是否存在且在当前帧属于合法动作。"""
         return (
             action is not None
             and 0 <= int(action) < len(self._legal_act)
@@ -1230,9 +1390,17 @@ class Preprocessor:
         )
 
     def _estimate_charge_trip(self, quick_dist, target_dist, path_found, route_reliable, first_charge_phase):
+        """
+        估计一次回桩行程的保守电量成本。
+
+        估计结果不仅看目标距离，还会根据是否找到路径、路径是否可靠、是否
+        处于首次充电阶段等因素增加额外预算，用来避免“纸面上够回去，实际却
+        死在路上或桩边”的情况。
+        """
         target_dist = int(target_dist if target_dist is not None else quick_dist)
-        # First charge failures are still the dominant loss mode, so estimate the return
-        # trip with a larger safety margin and let the agent turn back earlier.
+        # 回桩代价估计不是简单看“直线/路径距离”，而是要把路径不确定、
+        # 末段贴桩抖动、首次充电容错更低这些因素一起折进去。
+        # 首次充电阶段这里会明显更保守，从而把 return 触发点前移。
         trip_dist = float(target_dist) + (7.0 if first_charge_phase else 4.0)
         if first_charge_phase and target_dist >= 6:
             trip_dist += 2.0
@@ -1259,12 +1427,24 @@ class Preprocessor:
         return trip_dist
 
     def _resolve_charge_plan(self, target_pos, quick_dist, preferred_target=None, allow_unknown_fallback=False):
+        """
+        综合安全路径、未知区路径和贪心动作，解析本步的回桩计划。
+
+        返回结果会统一给出目标充电桩、首步动作、路径距离、路径可靠性以及
+        计划来源，供后续回充状态机和日志使用。
+
+        这里的优先级是：
+        1. 已知可走的安全路径。
+        2. 允许穿未知区的保守降级路径。
+        3. 实在没有整条路径时，再退化成一步式的贪心朝桩动作。
+        """
         target_dist = int(quick_dist)
         route_source = "quick"
         target_action = None
         path_found = False
         route_reliable = False
 
+        # 先尽量在已知可通行区域里规划，只有必要时才退化到 unknown 路径。
         route = self._get_best_route_to_charger(allow_unknown=False, preferred_target=preferred_target)
         if route is None and preferred_target is not None:
             route = self._get_best_route_to_charger(allow_unknown=False)
@@ -1287,6 +1467,7 @@ class Preprocessor:
                 route_reliable = False
                 route_source = "planned_unknown"
 
+        # 连完整路径都没有时，至少给上层一个“往桩方向迈一步”的兜底动作。
         if target_action is None:
             target_action = self._choose_action_towards(target_pos)
             if target_action is not None and not path_found:
@@ -1310,11 +1491,21 @@ class Preprocessor:
         current_visit,
         step_limit=0,
     ):
+        """
+        计算触发回桩所需的安全缓冲电量。
+
+        缓冲值会根据距离、路径可靠性、NPC 压力、访问次数以及是否仍处于
+        首次充电阶段动态放大，用来控制“什么时候必须停止探索并开始回桩”。
+
+        这个值本质上不是“返程距离本身”，而是“返程距离 + 不确定性保险”。
+        路线越差、局面越乱、越接近首充关键期，buffer 就要越大。
+        """
         buffer_value = max(28, int(self.battery_max * 0.16))
         buffer_value += min(16, max(0, int(target_dist)) // 2)
         if first_charge_phase:
-            # Reserve extra battery for the first docking attempt, because a miss here
-            # usually collapses the whole episode score.
+            # 首次回桩要额外预留缓冲电量，因为这里一旦失手，通常整局节奏就没了。
+            # 这部分 buffer 不是为了“多保守一点好看”，而是给 reroute、
+            # 末段摇摆、以及充电接触失败后的补救留空间。
             buffer_value += 14
             if step_limit > 0 and self.step_no >= max(step_limit - 20, 44):
                 buffer_value += 8
@@ -1350,11 +1541,32 @@ class Preprocessor:
         current_visit,
         locked_target=None,
     ):
+        """
+        构建完整的回充引导结果，是整个回桩学习链路的核心函数。
+
+        这个函数负责三件事：
+        1. 解析本步应当以哪个充电桩为目标，以及当前规划路径是否可靠。
+        2. 结合电量余量、首次充电预算、路线质量和卡顿情况，判断当前是否
+           应该进入或保持回桩状态。
+        3. 产出给特征、奖励和日志使用的“回桩语义状态”，例如：
+           - 当前是否已经进入回桩阶段；
+           - 现在是在返程中，还是已经进入近桩贴合阶段；
+           - 当前回桩紧迫度、电量裕量、路线可靠性分别如何。
+
+        当前版本的原则是“只做状态引导，不做动作硬控”：
+        这里导出的字段可以参与 reward shaping、训练指标和调试日志，
+        但不会再像旧版本那样在预处理器里直接接管策略动作。
+        """
+        # 这里是整套“回充状态机”的核心：
+        # 1. 先决定该跟哪个充电桩、走哪条路；
+        # 2. 再决定当前是否应该切入 / 保持 return 模式；
+        # 3. 最后把动作控制从“走路径”逐步收紧到“近桩微调”再到“最终贴桩”。
+        # 首次充电被单独当成一个更保守的子问题处理：先活着充上，再谈清扫收益。
         first_charge_out_radius = 0
         first_charge_step_limit = 0
         if first_charge_phase:
-            # The first charging cycle is the hardest constraint, so cap outward range
-            # and step budget more aggressively than later cycles.
+            # 首轮外扩半径和可容忍步数都要更紧。
+            # 原因不是怕少清一点，而是首次充电前没有稳定循环，一次失误代价最大。
             first_charge_out_radius = int(np.clip(max(7, soft_radius - 7), 7, 9))
             first_charge_step_limit = 74
             if quick_dist >= 24:
@@ -1368,8 +1580,8 @@ class Preprocessor:
 
         allow_unknown_fallback = False
         if first_charge_phase:
-            # When the safe path is missing, switch to broader charger search earlier
-            # instead of waiting until the battery margin is already exhausted.
+            # 首次充电时，一旦安全路径找不到，就更早允许退化到 unknown 路径搜索。
+            # 这样做是为了尽早开始“找得到路就先回去”，而不是等到电量已经不够兜底。
             allow_unknown_fallback = bool(
                 self.return_to_charge_mode
                 or self.step_no >= max(first_charge_step_limit - 24, 42)
@@ -1379,6 +1591,7 @@ class Preprocessor:
         else:
             allow_unknown_fallback = True
 
+        # 先决定“理论上怎么回去”，后面再决定“现在是否该回、以及控制收紧到什么程度”。
         plan = self._resolve_charge_plan(
             target_pos,
             quick_dist,
@@ -1391,18 +1604,21 @@ class Preprocessor:
         path_found = bool(plan["path_found"])
         route_reliable = bool(plan["route_reliable"])
         route_source = plan["route_source"]
-        recovery_mode = ""
+        rerouted = False
 
         reroute_stall_threshold = 5 if route_reliable else 4
         last_progress = None
         if self.last_charger_route_dist < 200.0:
             last_progress = float(self.last_charger_route_dist) - float(target_dist)
         committed_route = bool(self._is_charge_route_committed(target_pos))
+        # 只有在旧目标明显不再推进、或者已经卡住一段时间时，才允许 reroute。
+        # 否则频繁在多个充电桩 / 多条路径之间切换，会把末段贴桩搞得非常不稳定。
         allow_reroute = (
             (not committed_route)
             or (last_progress is not None and last_progress <= -1.0)
             or self._charge_progress_stall_steps >= reroute_stall_threshold + 2
         )
+        # 当已经处于回桩中且连续没有推进时，允许清掉缓存重新选路。
         if (
             self.return_to_charge_mode
             and target_pos is not None
@@ -1425,20 +1641,24 @@ class Preprocessor:
                 path_found = bool(reroute["path_found"])
                 route_reliable = bool(reroute["route_reliable"])
                 route_source = reroute["route_source"]
-                recovery_mode = "reroute"
+                rerouted = True
 
         reroute_stall_threshold = 5 if route_reliable else 4
+        # 首次充电时，只要路线质量弱，就要同步提前两件事：
+        # 1. 更早进入回桩；
+        # 2. 更早把控制权从 policy 交给 docking 规则。
         first_charge_route_risky = bool(
             first_charge_phase
             and ((not path_found) or (not route_reliable) or route_source in ("planned_unknown", "greedy"))
         )
+        # 根据路径可靠性决定何时从“返程”切到“近桩控制”。
         dock_radius = int(np.clip(max(4, soft_radius // 3 + (1 if path_found else 0)), 4, 6))
         if first_charge_phase:
             dock_radius = int(np.clip(max(dock_radius, 6), 5, 6))
         near_dock_threshold = max(dock_radius, 5 if route_reliable else 6)
         if first_charge_phase:
-            # Enter charger-zone control earlier in the first cycle so the policy stops
-            # spending the last safe battery on exploration noise.
+            # 首次充电更早进入 charger-zone 控制。
+            # 目的不是让规则更“强势”，而是尽早阻止策略网络在桩边浪费最后几步安全电量。
             near_dock_threshold = max(near_dock_threshold, 8 if first_charge_route_risky else 7)
         final_dock_threshold = 2
         if first_charge_phase:
@@ -1459,8 +1679,8 @@ class Preprocessor:
         elif route_source == "greedy":
             activation_buffer += 8 if first_charge_phase else 8
         if first_charge_phase:
-            # Inflate the activation budget during the first cycle so return mode starts
-            # while there is still enough energy for reroute plus final docking jitter.
+            # 首次充电要抬高 activation buffer，让 return 更早触发。
+            # 这里预留出来的不是单纯返程距离，而是“返程 + 可能重规划 + 末段抖动”的总预算。
             if not path_found:
                 activation_buffer += 14
             elif not route_reliable:
@@ -1471,6 +1691,7 @@ class Preprocessor:
                 activation_buffer += 8
         activation_buffer = int(min(self.battery_max - 1, activation_buffer))
         release_buffer = int(min(self.battery_max - 1, max(activation_buffer + 18, int(self.battery_max * 0.40))))
+        # battery_trip 是一次保守回桩成本估计，用来判断当前电量余量是否还够继续探索。
         battery_trip = self._estimate_charge_trip(
             quick_dist,
             target_dist,
@@ -1483,8 +1704,8 @@ class Preprocessor:
         elif route_source == "greedy":
             battery_trip += 6.0 if first_charge_phase else 6.0
         if first_charge_phase:
-            # Penalize weak route quality more strongly here because first-charge misses
-            # are much more expensive than giving up a few exploration steps.
+            # 首次充电时，对弱路线要施加更重的额外成本。
+            # 少探索几步的损失远小于第一次回桩失败的损失，所以这里故意偏保守。
             if not path_found:
                 battery_trip += 12.0
             elif not route_reliable:
@@ -1497,28 +1718,33 @@ class Preprocessor:
         first_charge_budget_buffer = 0
         first_charge_budget_margin = None
         if first_charge_phase:
+            # 单独保留一个“扣掉首次安全预留后的余额”。
+            # 这个数字一方面给 reward shaping 用，另一方面方便日志直接判断：
+            # 失败时到底是路线问题，还是其实早就该回了却没回。
             first_charge_budget_buffer = int(min(self.battery_max - 1, activation_buffer + 12))
             first_charge_budget_margin = int(battery_margin - first_charge_budget_buffer)
 
         just_recharged = self._did_charge_this_step(target_dist)
+        # 一旦本步刚刚成功充电，先做状态收尾，再决定是否退出 return 模式。
         if just_recharged:
             self._handle_charge_success()
 
+        # 退出 return 模式必须满足两个条件：
+        # 1. 电量确实已经补满到接近满格；
+        # 2. 当前位置已经处在最终贴桩接触区。
+        # 否则就会出现“看起来快充上了，结果提前松手又掉出来”的问题。
         charge_ready_release = bool(
             (not first_charge_phase)
             and self.return_to_charge_mode
             and self.charge_count > 0
-            and target_dist <= near_dock_threshold + 1
+            and target_dist <= max(final_dock_threshold, 1)
             and battery_margin >= max(release_buffer, activation_buffer + 12)
-            and (
-                self.remaining_charge >= self.battery_max - 1
-                or target_dist <= final_dock_threshold
-                or self._charge_progress_stall_steps >= 2
-            )
+            and self.remaining_charge >= self.battery_max - 1
         )
 
         should_return = False
         reason = ""
+        # should_return 是最关键的高层布尔量，表示当前这一帧是否应该处于回桩周期里。
         if just_recharged:
             should_return = False
             reason = "charge_success_release"
@@ -1527,11 +1753,14 @@ class Preprocessor:
             reason = "charge_buffer_release"
             self._apply_post_charge_sequence()
         elif self.return_to_charge_mode:
+            # 一旦已经进入回充流程，尤其是首次充电，不允许中途又切回探索。
+            # 只有真正充电成功，或者 release 条件明确成立，才能退出这个状态。
             should_return = True
             reason = "first_charge_hold_return" if first_charge_phase else "hold_return"
         elif first_charge_phase:
-            # During the first cycle, any sign of risky routing should flip into return
-            # mode early; the goal is "charge first, optimize score later".
+            # 首次充电分支宁可“稍微早回一点”，也不接受“该回没回”。
+            # 这里故意偏向 false positive，因为过早回桩只损失局部收益，
+            # 而第一次没充上常常会直接毁掉整局表现。
             risky_return_step = max(first_charge_step_limit - (28 if first_charge_route_risky else 24), 42)
             risky_out_radius = max(first_charge_out_radius - (1 if first_charge_route_risky else 0), 6)
             if battery_margin <= activation_buffer:
@@ -1591,13 +1820,15 @@ class Preprocessor:
                 reason = "late_cycle_return"
 
         self.return_to_charge_mode = bool(should_return)
-        if self.return_to_charge_mode:
+        if self.return_to_charge_mode and target_pos is not None:
             self.post_charge_expand_until_step = -1
             self._clear_post_charge_release()
             self._clear_expand_focus()
             if target_pos is not None and (
                 first_charge_phase or (not route_reliable) or target_dist <= near_dock_threshold + 1
             ):
+                # 首次充电或路线不稳时，把目标充电桩短暂锁住。
+                # 这样可以避免低电量时在多个桩之间来回摇摆，导致路径和末段控制都不稳定。
                 if first_charge_phase:
                     lock_steps = 10 if (target_dist <= near_dock_threshold + 1 or first_charge_route_risky) else 6
                 else:
@@ -1608,95 +1839,63 @@ class Preprocessor:
             if not first_charge_phase:
                 self._clear_charge_target_lock()
 
+        # 回桩内部再细分成 return / near_dock / final_dock 三段，
+        # 本质是距离越近，允许的动作集合越窄、控制越保守。
+        # 回桩阶段现在只输出“状态引导”，不再在预处理器里接管动作。
+        # 这里保留两层语义：
+        # 1. return：已经该回桩了，但还在回程路上；
+        # 2. dock：已经进入近桩区，学习重点从“会不会回去”转成“最后几步怎么贴稳”。
         dock_mode = bool(self.return_to_charge_mode and target_dist <= near_dock_threshold)
         final_dock_mode = bool(self.return_to_charge_mode and target_dist <= final_dock_threshold)
-        force_action = None
-        control_actions = []
-        controller_mode = ""
-        if self.return_to_charge_mode:
-            dock_action = None
-            if target_pos is not None and target_dist <= near_dock_threshold + (1 if first_charge_route_risky else 0) and (
-                target_dist <= final_dock_threshold or (not path_found) or (not route_reliable)
-            ):
-                dock_action = self._choose_action_towards(target_pos)
-                if self._is_valid_legal_action(dock_action):
-                    target_action = int(dock_action)
-                    if recovery_mode == "" and target_dist > final_dock_threshold:
-                        recovery_mode = "approach"
-
-            preferred_action = int(target_action) if self._is_valid_legal_action(target_action) else None
-            strict_progress = bool(final_dock_mode or (dock_mode and self._charge_progress_stall_steps >= 3))
-            ranked_actions = self._rank_charge_actions(
-                target_pos,
-                target_action=preferred_action,
-                dock_mode=dock_mode,
-                strict_progress=strict_progress,
-            )
-            if not ranked_actions:
-                ranked_actions = self._rank_charge_actions(
-                    target_pos,
-                    target_action=preferred_action,
-                    dock_mode=dock_mode,
-                    strict_progress=False,
-                )
-            if preferred_action is not None and preferred_action not in ranked_actions:
-                ranked_actions = [preferred_action] + ranked_actions
-
-            if final_dock_mode:
-                controller_mode = "final_dock"
-                limit = 3
-                commit_dist = 3 if first_charge_phase else 2
-                if target_dist <= commit_dist:
-                    if self._is_valid_legal_action(dock_action):
-                        force_action = int(dock_action)
-                    elif ranked_actions:
-                        force_action = int(ranked_actions[0])
-            elif dock_mode:
-                controller_mode = "near_dock"
-                limit = 3
-                # Near the charger, promote the direct docking action so the final steps
-                # are mostly rule-driven instead of policy-driven.
-                if self._is_valid_legal_action(dock_action) and (
-                    first_charge_phase
-                    or (not route_reliable)
-                    or self._charge_progress_stall_steps >= 1
-                    or target_dist <= max(final_dock_threshold + 1, 3)
-                ):
-                    force_action = int(dock_action)
-                    if first_charge_phase or self._charge_progress_stall_steps >= 1:
-                        limit = 1 if target_dist <= max(final_dock_threshold + 1, 3) else 2
-                    else:
-                        limit = 2
-            elif recovery_mode == "reroute" or self._charge_progress_stall_steps >= reroute_stall_threshold:
-                controller_mode = "return_recovery"
-                limit = 4 if route_reliable else 5
-            else:
-                controller_mode = "return"
-                limit = 4 if route_reliable else 5
-
-            control_actions = ranked_actions[:limit]
-            if force_action is not None and force_action not in control_actions:
-                control_actions = [int(force_action)] + [action for action in control_actions if action != int(force_action)]
-                control_actions = control_actions[:limit]
+        target_action = int(target_action) if self._is_valid_legal_action(target_action) else None
+        if self.return_to_charge_mode and target_pos is not None:
+            direct_dock_window = max(final_dock_threshold + 1, 3)
+            if (not path_found) or (not route_reliable) or self._charge_progress_stall_steps >= 2:
+                direct_dock_window += 1
+            if target_dist <= direct_dock_window:
+                candidate_action = self._choose_action_towards(target_pos)
+                if self._is_valid_legal_action(candidate_action):
+                    target_action = int(candidate_action)
 
         urgency = 0.0
         if self.return_to_charge_mode:
             shortfall = max(0.0, activation_buffer - battery_margin) / max(float(activation_buffer), 1.0)
             stall_pressure = min(float(self._charge_progress_stall_steps) / 6.0, 1.0)
             dock_pressure = 1.0 - min(float(target_dist) / max(float(near_dock_threshold + 1), 1.0), 1.0)
-            urgency = float(np.clip(max(shortfall, stall_pressure * 0.6, dock_pressure * 0.7), 0.25, 1.0))
-            if controller_mode == "near_dock":
+            route_pressure = 0.35 if not path_found else (0.18 if not route_reliable else 0.0)
+            budget_pressure = 0.0
+            if first_charge_budget_margin is not None:
+                budget_scale = max(float(first_charge_budget_buffer), float(activation_buffer), 1.0)
+                budget_pressure = max(0.0, -float(first_charge_budget_margin)) / budget_scale
+
+            urgency = float(
+                np.clip(
+                    max(shortfall, stall_pressure * 0.75, dock_pressure * 0.60, route_pressure, budget_pressure),
+                    0.25,
+                    1.0,
+                )
+            )
+            if dock_mode:
                 urgency = max(urgency, 0.62 if route_reliable else 0.58)
-            elif controller_mode == "final_dock":
+            if final_dock_mode:
                 urgency = max(urgency, 0.78 if route_reliable else 0.72)
-            if first_charge_phase and controller_mode == "near_dock":
-                urgency = max(urgency, 0.70 if first_charge_route_risky else 0.64)
-            elif first_charge_phase and controller_mode == "final_dock":
-                urgency = max(urgency, 0.84 if first_charge_route_risky else 0.80)
+            if first_charge_phase:
+                urgency = max(urgency, 0.68 if dock_mode else 0.58)
+                if final_dock_mode:
+                    urgency = max(urgency, 0.84 if first_charge_route_risky else 0.80)
 
         first_charge_stage = "explore"
         if self.return_to_charge_mode:
-            first_charge_stage = "dock" if dock_mode else "return"
+            if final_dock_mode:
+                first_charge_stage = "final_dock"
+            elif dock_mode:
+                first_charge_stage = "dock"
+            else:
+                first_charge_stage = "return"
+
+        route_source_name = route_source
+        if rerouted and route_source_name:
+            route_source_name = f"reroute_{route_source_name}"
 
         return {
             "should_return": self.return_to_charge_mode,
@@ -1713,12 +1912,7 @@ class Preprocessor:
             "hard_radius": hard_radius,
             "dock_mode": dock_mode,
             "dock_radius": dock_radius,
-            "return_mode": "dock" if dock_mode else ("return" if self.return_to_charge_mode else ""),
-            "recovery_mode": recovery_mode,
-            "controller_mode": controller_mode,
-            "force_action": force_action,
-            "control_actions": control_actions,
-            "route_source": route_source,
+            "route_source": route_source_name,
             "route_reliable": route_reliable,
             "first_charge_phase": bool(first_charge_phase),
             "first_charge_stage": first_charge_stage,
@@ -1728,7 +1922,6 @@ class Preprocessor:
             ),
             "first_charge_step_limit": int(first_charge_step_limit),
             "first_charge_out_radius": int(first_charge_out_radius),
-            "charge_rule_control": bool(self.return_to_charge_mode),
             "charge_stall_steps": int(self._charge_progress_stall_steps),
         }
 
@@ -1751,6 +1944,12 @@ class Preprocessor:
         should_pull_back=False,
         force_action=None,
     ):
+        """
+        按统一格式组装探索引导字典，避免调用方重复填充字段。
+
+        这个函数本身不做策略判断，只负责把探索目标、模式、强度和调试字段
+        组织成统一结构，降低上层状态机分支的重复代码。
+        """
         guidance = self._empty_explore_guidance()
         guidance.update(
             {
@@ -1785,6 +1984,9 @@ class Preprocessor:
         return guidance
 
     def _build_first_charge_guidance(self, target_pos, quick_dist, soft_radius, hard_radius, current_visit, locked_target):
+        """为首次充电阶段单独包装一层回桩入口，集中保守策略分支。"""
+        # 单独包一层首次充电入口，目的是让调用路径、日志、后续排查都保持清晰。
+        # 后面如果还要继续单独强化首次回桩，也有明确落点。
         return self._build_charge_guidance_core(
             first_charge_phase=True,
             target_pos=target_pos,
@@ -1796,6 +1998,12 @@ class Preprocessor:
         )
 
     def _build_charge_guidance(self):
+        """
+        生成当前时刻的回充引导结果。
+
+        这里会先确定最近或锁定的充电桩，再根据是否仍处于首次充电阶段，
+        分派到不同的回桩策略分支，最终得到统一的回充控制信息。
+        """
         target_pos, quick_dist = self._nearest_point(self._charger_positions)
         if target_pos is None:
             self.return_to_charge_mode = False
@@ -1818,7 +2026,10 @@ class Preprocessor:
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             current_visit = int(self.visit_count[hx, hz])
 
+        # 首充前后走不同分支，是这套状态机最重要的阶段差异之一。
         if first_charge_phase:
+            # 第一次充电前走更保守的分支；一旦完成首次成功充电，
+            # 后续周期就可以适当放松，不必一直按最紧的安全约束运行。
             return self._build_first_charge_guidance(
                 target_pos=target_pos,
                 quick_dist=quick_dist,
@@ -1838,9 +2049,20 @@ class Preprocessor:
         )
 
     def get_charge_guidance(self):
+        """返回当前回充引导的只读副本。"""
         return dict(self._charge_guidance)
 
     def _build_explore_guidance(self):
+        """
+        构建探索阶段的局部引导策略。
+
+        该函数只在“不需要回桩”时生效。它会结合当前回充预算、期望探索半径、
+        充电后的离桩/外扩窗口、局部脏污情况以及探索焦点保持状态，决定当前
+        是否需要主动外扩、离开充电桩附近，还是仅做局部清扫。
+
+        它和回充状态机是联动的：
+        回充负责画出“安全边界”，探索负责在边界内尽量把清扫收益做高。
+        """
         guidance = self._charge_guidance
         if guidance["target_pos"] is None or guidance["target_dist"] is None:
             self._explore_route_cache = None
@@ -1864,7 +2086,10 @@ class Preprocessor:
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             current_visit = int(self.visit_count[hx, hz])
 
+        # 首充前的探索半径会明显收紧，核心目标是先建立一次成功充电闭环。
         if first_charge_phase:
+            # 首次成功充电之前，探索半径要更紧。
+            # 本质上是在告诉 agent：先别贪边角收益，先保证还有余量回家。
             desired_radius = int(
                 np.clip(
                     max(6, int(guidance.get("first_charge_out_radius", max(8, soft_radius - 6))) - 1),
@@ -1884,6 +2109,7 @@ class Preprocessor:
                 )
             )
 
+        # 成功充电后，允许短时间做一轮“离桩外扩”，避免一直在充电桩附近来回清扫。
         post_charge_expand = self._has_post_charge_expand() and battery_margin >= max(activation_buffer + 6, 18)
         if post_charge_expand:
             desired_radius = int(
@@ -1908,6 +2134,7 @@ class Preprocessor:
         budget_limit = int(max(desired_radius + 2, self.remaining_charge - max(activation_buffer, 12)))
 
         explore_target = None
+        # 有焦点保持期时优先沿用旧目标，减少探索目标帧间抖动。
         if hold_active or post_charge_expand:
             explore_target = self._get_expand_focus_candidate(
                 charger_pos=guidance["target_pos"],
@@ -1927,6 +2154,7 @@ class Preprocessor:
                 budget_limit=budget_limit,
             )
 
+        # 刚充完电时优先先把机器人从桩边拉开，再接探索目标，避免反复贴桩空转。
         if post_charge_release:
             force_action = self._choose_action_away_from(guidance["target_pos"])
             if self._is_valid_legal_action(force_action):
@@ -1976,6 +2204,7 @@ class Preprocessor:
             self._clear_post_charge_release()
             post_charge_release = False
 
+        # 没有合适外扩目标时，退回到局部清扫或轻度离桩。
         if explore_target is None:
             should_recenter = bool(
                 (not first_charge_phase)
@@ -2022,6 +2251,7 @@ class Preprocessor:
             self._expand_focus_target = new_focus_target
             self._expand_focus_reason = "post_charge_expand" if post_charge_expand else "expand_frontier"
 
+        # 强度越大，表示当前越应该主动向外扩，而不是停在局部做微小游走。
         expand_gap = max(0, desired_radius - target_dist)
         intensity = float(
             np.clip(
@@ -2055,9 +2285,17 @@ class Preprocessor:
         return explore_guidance
 
     def get_explore_guidance(self):
+        """返回当前探索引导的只读副本。"""
         return dict(self._explore_guidance)
 
     def _build_npc_guidance(self):
+        """
+        根据最近 NPC 的位置，构建动作级规避偏置。
+
+        输出结果既包含一个最安全动作，也包含每个动作的权重分布。agent 侧
+        会把这些权重混入策略分布，从而在不完全覆盖模型的前提下，减少贴近
+        NPC 或与 NPC 正面相撞的概率。
+        """
         npc_point, npc_dist = self._nearest_point(self._npc_positions)
         if npc_point is None or npc_dist is None:
             return self._empty_npc_guidance()
@@ -2130,11 +2368,25 @@ class Preprocessor:
         }
 
     def get_npc_guidance(self):
+        """返回当前 NPC 规避引导的副本，并复制动作权重列表。"""
         guidance = dict(self._npc_guidance)
         guidance["action_weights"] = list(self._npc_guidance.get("action_weights", []))
         return guidance
 
     def _get_global_state_feature(self):
+        """
+        提取局部视野之外的全局状态特征。
+
+        这部分特征把地图探索进度、电量、清扫进度、回桩状态、探索目标、
+        NPC 距离和高层策略模式编码成定长向量，与局部地图特征拼接后一起
+        输入策略网络。
+
+        其中和充电最相关的字段包括：
+        - 充电桩相对方向与距离。
+        - 当前安全返程余量 `safe_return_margin`。
+        - 当前是否进入低电量回桩告警 `low_battery_alert`。
+        - 当前整体处于 clean / expand / return / dock 哪个高层阶段。
+        """
         hx, hz = self.cur_pos
         local_total = float(self._view_map.size)
 
@@ -2206,6 +2458,7 @@ class Preprocessor:
             else:
                 npc_danger = 0.0
 
+        # 特征排列顺序保持固定，便于和模型输入维度严格对齐。
         return np.array(
             [
                 _norm(self.step_no, self.max_step),
@@ -2251,9 +2504,21 @@ class Preprocessor:
         )
 
     def get_legal_action(self):
+        """返回当前帧的合法动作掩码。"""
         return list(self._legal_act)
 
     def get_debug_snapshot(self):
+        """
+        导出当前控制状态的调试快照。
+
+        这个快照主要服务三类排查：
+        1. 首充为什么失败，是回桩触发太晚，还是已经回去了但贴桩没贴上。
+        2. 低电量阶段是否真的在持续向充电桩推进。
+        3. 回桩阶段是否经常出现路线找不到、持续卡顿、贴桩不充等问题。
+
+        当前版本不再暴露旧规则控制器的 planned/force_action 一类字段，
+        因为训练目标已经切换成“策略自己学会回桩”，这里更强调回桩质量指标。
+        """
         _, npc_dist = self._nearest_point(self._npc_positions)
         hx, hz = self.cur_pos
         current_visit = 0
@@ -2264,6 +2529,15 @@ class Preprocessor:
         npc_guidance = self._npc_guidance
         explore_guidance = self._explore_guidance
         strategy = self._strategy_state
+        low_battery_route_progress_mean = None
+        if self.low_battery_route_progress_count > 0:
+            low_battery_route_progress_mean = (
+                float(self.low_battery_route_progress_sum) / float(self.low_battery_route_progress_count)
+            )
+        charge_route_found_rate = 0.0
+        if self.charge_guidance_steps > 0:
+            charge_route_found_rate = float(self.charge_route_found_steps) / float(self.charge_guidance_steps)
+
         return {
             "pos": self.cur_pos,
             "remaining_charge": int(self.remaining_charge),
@@ -2282,23 +2556,41 @@ class Preprocessor:
             "charge_route_source": guidance["route_source"],
             "charge_route_reliable": bool(guidance.get("route_reliable")),
             "charge_stall_steps": int(guidance.get("charge_stall_steps", 0)),
-            "charge_return_mode": guidance.get("return_mode", ""),
-            "charge_recovery_mode": guidance.get("recovery_mode", ""),
-            "charge_controller_mode": guidance.get("controller_mode", ""),
-            "charge_allowed_count": len(guidance.get("control_actions") or []),
+            "charge_route_progress_delta": (
+                None
+                if self.last_charger_route_dist >= 200.0 or self.charger_route_dist >= 200.0
+                else float(self.last_charger_route_dist - self.charger_route_dist)
+            ),
             "soft_clean_radius": int(guidance["soft_radius"]),
             "hard_clean_radius": int(guidance["hard_radius"]),
             "dock_mode": bool(guidance["dock_mode"]),
             "dock_radius": int(guidance["dock_radius"]),
             "first_charge_phase": bool(guidance.get("first_charge_phase")),
             "first_charge_stage": guidance.get("first_charge_stage", ""),
+            "first_charge_step": None if self.first_charge_step is None else int(self.first_charge_step),
             "first_charge_budget_buffer": int(guidance.get("first_charge_budget_buffer", 0)),
             "first_charge_budget_margin": (
                 None if guidance.get("first_charge_budget_margin") is None else int(guidance.get("first_charge_budget_margin"))
             ),
             "first_charge_step_limit": int(guidance.get("first_charge_step_limit", 0)),
             "first_charge_out_radius": int(guidance.get("first_charge_out_radius", 0)),
-            "charge_rule_control": bool(guidance.get("charge_rule_control")),
+            "return_trigger_step": None if self.return_trigger_step is None else int(self.return_trigger_step),
+            "return_trigger_margin": None if self.return_trigger_margin is None else int(self.return_trigger_margin),
+            "first_return_trigger_step": (
+                None if self.first_return_trigger_step is None else int(self.first_return_trigger_step)
+            ),
+            "min_battery_margin": None if self.min_battery_margin is None else int(self.min_battery_margin),
+            "battery_margin_at_first_charge": (
+                None if self.battery_margin_at_first_charge is None else int(self.battery_margin_at_first_charge)
+            ),
+            "low_battery_steps": int(self.low_battery_steps),
+            "low_battery_route_progress_mean": low_battery_route_progress_mean,
+            "dock_contact_without_charge": int(self.dock_contact_without_charge),
+            "route_stall_steps_total": int(self.route_stall_steps_total),
+            "max_charge_stall_steps": int(self.max_charge_stall_steps),
+            "charge_route_found_steps": int(self.charge_route_found_steps),
+            "charge_guidance_steps": int(self.charge_guidance_steps),
+            "charge_route_found_rate": float(charge_route_found_rate),
             "strategy_mode": strategy["mode_name"],
             "strategy_intensity": float(strategy["mode_intensity"]),
             "explore_mode": bool(explore_guidance["active"]),
@@ -2318,129 +2610,177 @@ class Preprocessor:
             "npc_reason": npc_guidance["reason"],
             "npc_action": npc_guidance["target_action"],
             "npc_safe_dist": npc_guidance["safest_next_dist"],
+            "last_action": int(self.last_action),
         }
 
     def feature_process(self, env_obs, last_action):
+        """
+        对单帧观测执行完整预处理，输出特征、合法动作和 shaped reward。
+
+        这是 agent 侧获取输入的直接入口：先刷新内部状态，再拼接局部视野、
+        全局状态和合法动作掩码，并同步产出当前步的奖励。
+
+        返回三元组：
+        1. `feature`：模型输入向量。
+        2. `legal_action`：合法动作掩码。
+        3. `reward`：当前 step 的 shaped reward。
+        """
         self.pb2struct(env_obs, last_action)
 
         local_view = self._get_local_view_feature()
         global_state = self._get_global_state_feature()
         legal_action = self.get_legal_action()
 
+        # 模型最终输入 = 局部地图 + 全局状态 + 合法动作掩码。
         feature = np.concatenate([local_view, global_state, np.array(legal_action, dtype=np.float32)])
         reward = self.reward_process()
         return feature, legal_action, reward
 
     def reward_process(self):
+        """
+        计算当前 step 的 shaped reward。
+
+        这是“只靠奖励函数学会回桩充电”的核心入口，目标非常明确：
+        1. 在电量健康时，继续鼓励清扫和探索，不要让策略过早保守。
+        2. 一旦电量进入危险区，奖励重心立刻切到“是否朝充电桩持续推进”。
+        3. 成功充电要给足够大的正反馈，尤其是首次充电，要明显大于普通充电。
+        4. 对贴桩不充、低电量退步、长时间卡顿、首充预算超支等失败前兆给出明确惩罚。
+
+        这里会读取 `charge_guidance` 里的目标距离、电量裕量和回桩阶段信息，
+        但这些信息只用于 reward shaping，不会再直接改写最终动作。
+        因此策略网络是否真的学会“主动回去并充上”，要靠 PPO 自己从这些奖励信号中学出来。
+        """
         cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
+        new_explored_cells = max(0, self.explored_cells - self.prev_explored_cells)
+        charged_this_step = bool(self.charge_count > self.prev_charge_count)
+        first_charge_success = bool(charged_this_step and self.prev_charge_count <= 0)
+
         guidance = self._charge_guidance
+        should_return = bool(guidance.get("should_return"))
+        dock_mode = bool(guidance.get("dock_mode"))
         first_charge_phase = bool(guidance.get("first_charge_phase"))
         first_charge_budget_margin = guidance.get("first_charge_budget_margin")
         if first_charge_budget_margin is not None:
             first_charge_budget_margin = int(first_charge_budget_margin)
-        new_explored_cells = max(0, self.explored_cells - self.prev_explored_cells)
-        charged_this_step = bool(self.charge_count > self.prev_charge_count)
-        first_charge_success = bool(charged_this_step and self.prev_charge_count <= 0)
+        battery_margin = guidance.get("battery_margin")
+        if battery_margin is not None:
+            battery_margin = int(battery_margin)
+        target_dist = guidance.get("target_dist")
+        activation_buffer = int(guidance.get("activation_buffer", 0))
+        low_battery_threshold = max(8, activation_buffer // 2)
+        low_battery = bool(battery_margin is not None and battery_margin <= low_battery_threshold)
+        critical_battery = bool(battery_margin is not None and battery_margin < 0)
+
         hx, hz = self.cur_pos
         current_visit = 0
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
             current_visit = int(self.visit_count[hx, hz])
 
+        route_progress = None
+        if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
+            route_progress = float(self.last_charger_route_dist - self.charger_route_dist)
+        stall_steps = int(guidance.get("charge_stall_steps", 0))
+
+        # 统一的轻微生存成本，避免策略通过无意义拖时长白拿零奖励。
         reward = -0.0025
 
-        cleaning_reward = 0.075 * cleaned_this_step
-        if guidance["should_return"]:
-            cleaning_reward *= 0.18 if guidance["dock_mode"] else 0.35
-        reward += cleaning_reward
+        # 当已经进入回桩/低电量阶段时，弱化清扫和探索奖励，避免局部收益继续把策略拉离充电目标。
+        clean_scale = 0.22 if low_battery else (0.35 if should_return else 1.0)
+        explore_scale = 0.12 if low_battery else (0.25 if should_return else 1.0)
+        reward += 0.08 * cleaned_this_step * clean_scale
+        reward += 0.0035 * min(new_explored_cells, 6) * explore_scale
 
-        if not guidance["should_return"] and new_explored_cells > 0:
-            reward += 0.0040 * min(new_explored_cells, 6)
+        # 对高访问次数且没有任何产出的停留做惩罚，降低来回抖动和空转。
+        if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 6:
+            reward -= 0.003 * min(current_visit - 5, 6)
 
+        # 充电成功一定要比普通局部收益高很多，否则策略会更倾向“继续赌几步清扫”。
         if charged_this_step:
-            reward += 0.18
+            reward += 1.30
             if first_charge_success:
-                reward += 0.95
+                reward += 1.10
                 if self.step_no <= 220:
-                    reward += 0.10
+                    reward += 0.20
                 elif self.step_no <= 320:
-                    reward += 0.05
+                    reward += 0.10
 
+            # 如果一轮充电前几乎没有拿到任何有效收益，说明策略可能在刷“低价值小循环”，
+            # 这里稍微压一下，避免模型学成“刚出门就回桩”。
             cycle_explore_gain = int(self.prev_charge_cycle_explore_gain)
             cycle_clean_gain = int(self.prev_charge_cycle_clean_gain)
             if cycle_explore_gain <= 2 and cycle_clean_gain <= 4:
-                reward -= 0.28
+                reward -= 0.32
             elif cycle_explore_gain <= 6 and cycle_clean_gain <= 10:
-                reward -= 0.12
+                reward -= 0.14
             elif cycle_explore_gain >= 24 or cycle_clean_gain >= 30:
-                reward += 0.08
+                reward += 0.12
 
-        if not guidance["should_return"]:
-            charger_dist = guidance.get("target_dist")
-            battery_margin = guidance.get("battery_margin")
-            activation_buffer = int(guidance.get("activation_buffer", 0))
-
-            if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 6:
-                reward -= 0.004 * min(current_visit - 5, 6)
-
-            if (
-                charger_dist is not None
-                and battery_margin is not None
-                and int(battery_margin) >= activation_buffer + 10
-                and int(charger_dist) <= int(guidance.get("dock_radius", 0)) + 1
-            ):
-                reward -= 0.018
-                if current_visit >= 4:
-                    reward -= 0.003 * min(current_visit - 3, 5)
-
-        route_progress = None
-        if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
-            route_progress = self.last_charger_route_dist - self.charger_route_dist
-
-        if guidance["should_return"]:
+        # 进入回桩 / 低电量阶段后，奖励核心变成“是否真的在向充电桩推进”。
+        if should_return or low_battery:
+            reward -= 0.004 if low_battery else 0.0015
             if route_progress is not None:
+                progress_scale = 0.040 if dock_mode else 0.036
+                regress_scale = 0.060 if dock_mode else 0.055
                 if route_progress > 0:
-                    progress_scale = 0.028 if guidance["dock_mode"] else 0.022
                     reward += progress_scale * min(route_progress, 2.0)
                 elif route_progress < 0:
-                    regress_scale = 0.042 if guidance["dock_mode"] else 0.032
                     reward += regress_scale * max(route_progress, -2.0)
 
-            battery_margin = guidance.get("battery_margin")
-            if battery_margin is not None and int(battery_margin) < 0:
-                reward -= 0.030 if guidance["dock_mode"] else 0.024
-            if not guidance["path_found"]:
-                reward -= 0.004
+                # 首充阶段进一步放大“往回走”和“往外跑”的差异，
+                # 让首充回桩更容易成为 PPO 早期学到的强信号。
+                if first_charge_phase:
+                    if route_progress > 0:
+                        reward += 0.012 * min(route_progress, 2.0)
+                    elif route_progress < 0:
+                        reward += 0.018 * max(route_progress, -2.0)
 
-            stall_steps = int(guidance.get("charge_stall_steps", 0))
-            if stall_steps >= 2:
-                reward -= 0.008 * min(stall_steps, 6)
-                if guidance["dock_mode"]:
-                    reward -= 0.004 * min(stall_steps, 4)
-
-            target_dist = guidance.get("target_dist")
-            if guidance["dock_mode"] and target_dist is not None and int(target_dist) <= 1 and not charged_this_step:
+            if critical_battery:
                 reward -= 0.035
 
+            if not guidance.get("path_found", False):
+                reward -= 0.006
+            elif not guidance.get("route_reliable", False):
+                reward -= 0.0035
+
+            if stall_steps >= 2:
+                reward -= 0.010 * min(stall_steps, 6)
+                if dock_mode:
+                    reward -= 0.005 * min(stall_steps, 4)
+
+            if dock_mode and target_dist is not None and int(target_dist) <= 1 and not charged_this_step:
+                reward -= 0.055
+            elif dock_mode and target_dist is not None and int(target_dist) <= 2:
+                if route_progress is not None and route_progress <= 0:
+                    reward -= 0.015
+
+        # 当已经非常接近回桩阈值却还没进入回桩模式时，也给一个轻微警告，
+        # 让策略逐步学会“不要把安全余量耗到极限再回”。
+        elif battery_margin is not None and battery_margin <= activation_buffer + 4 and not charged_this_step:
+            reward -= 0.006
+
+        # 首充阶段额外强调“及时回去并充上”，这是当前最优先提升的训练目标。
         if first_charge_phase:
             if first_charge_budget_margin is not None:
-                if not guidance["should_return"] and first_charge_budget_margin <= 0:
-                    reward -= 0.032
-                elif not guidance["should_return"] and first_charge_budget_margin <= 6:
-                    reward -= 0.014
-                elif guidance["should_return"] and first_charge_budget_margin < -6:
-                    reward -= 0.010
+                if not should_return and first_charge_budget_margin <= 0:
+                    reward -= 0.060
+                elif not should_return and first_charge_budget_margin <= 6:
+                    reward -= 0.024
+                elif should_return and first_charge_budget_margin < -6:
+                    reward -= 0.018
 
             if self.step_no >= 160:
                 reward -= 0.004
             if self.step_no >= 220:
-                reward -= 0.008
+                reward -= 0.010
             if self.step_no >= 300:
-                reward -= 0.012
+                reward -= 0.016
 
+        # 保留简单的 NPC 风险 shaping，避免为了清扫或回充直接撞上 NPC。
         if self.nearest_npc_dist <= 1:
-            reward -= 0.04
+            reward -= 0.040
         elif self.nearest_npc_dist == 2:
             reward -= 0.015
+
         if self.last_nearest_npc_dist <= 4:
             if self.nearest_npc_dist > self.last_nearest_npc_dist:
                 reward += 0.006
